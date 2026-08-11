@@ -1,0 +1,60 @@
+# Global behaviour. Every value here matches the built-in default in
+# src/config/models.py; the file exists so an operator can see and change them.
+#
+# Precedence: CLI arguments > environment variables > this file > defaults.
+
+# Thread pool size for the extraction phase. Databases run concurrently;
+# objects within a database always run sequentially.
+max_workers: 4
+
+# Subtracted from the watermark before querying LAST_DDL_TIME. Guards against
+# second-granularity DATE truncation and clock skew. Re-processing an unchanged
+# object costs only extraction time — Git produces no diff.
+watermark_overlap_minutes: 5
+
+# Oracle fetch tuning, so a large package body is one round trip.
+arraysize: 1000
+prefetchrows: 1000
+
+repository_root: repository
+state_file: state/execution_state.json
+
+# Individually switchable normalization rules. Rule switches are logged so an
+# unexpected diff can be traced back to a configuration change.
+normalization:
+  unify_line_endings: true
+  expand_tabs: true
+  tab_width: 4
+  strip_trailing_whitespace: true
+  remove_storage_clauses: true
+  normalize_create_or_replace: true
+  normalize_quoted_identifiers: true
+  normalize_keyword_case: true
+  collapse_blank_lines: true
+  normalize_terminator: true
+  ensure_trailing_newline: true
+
+# Deleted-object reconciliation (decisions D-1 and D-6).
+reconciliation:
+  enabled: true
+  mass_delete_threshold_percent: 10.0
+  allow_mass_delete: false
+
+# Retry budgets. Only plausibly transient failures are retried.
+retry:
+  connect_attempts: 3
+  connect_backoff_seconds: 2.0
+  query_attempts: 2
+  extraction_attempts: 1
+  push_attempts: 3
+  push_backoff_seconds: 1.0
+  jitter_ratio: 0.2
+  run_unit_timeout_seconds: 3600
+
+git:
+  branch: main
+  remote: origin
+  author_name: oracle-versioning-bot
+  author_email: oracle-versioning-bot@example.invalid
+  token_env: GIT_PUSH_TOKEN     # name only — the token comes from a CI/CD variable
+  skip_ci_marker: "[skip ci]"

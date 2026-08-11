@@ -1,0 +1,155 @@
+# Oracle DDL Versioning Agent pipeline (docs/architecture.md §20).
+#
+# The jobs are thin wrappers: everything meaningful lives in the application,
+# so the same behaviour is reproducible locally with `python -m src.main`.
+
+stages:
+  - validate
+  - build
+  - sync
+
+variables:
+  PYTHON_IMAGE: "python:3.13-slim"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_CACHE_DIR: "1"
+
+default:
+  interruptible: true
+
+# GitLab's own secret detection — no third-party dependency, and it scans the
+# whole history rather than just the diff (docs/architecture.md §21.5).
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+
+# ---------------------------------------------------------------------------
+# validate — merge requests and pushes. Fully offline: no Oracle, no database
+# network access, no GitLab pushes. All three jobs are blocking (CLAUDE.md §6).
+# ---------------------------------------------------------------------------
+
+.python:
+  image: $PYTHON_IMAGE
+  before_script:
+    - pip install -r requirements-dev.txt
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+unit-tests:
+  extends: .python
+  stage: validate
+  before_script:
+    - apt-get update && apt-get install --no-install-recommends -y git
+    - git config --global user.email "ci@example.invalid"
+    - git config --global user.name "CI"
+    - pip install -r requirements-dev.txt
+  script:
+    # Includes the two tests CLAUDE.md §6 marks blocking: the read-only SQL
+    # guard and the no-secrets-in-logs sentinel.
+    - python -m pytest -q --junitxml=report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+    expire_in: 30 days
+
+lint:
+  extends: .python
+  stage: validate
+  script:
+    - python -m ruff check src tests
+
+type-check:
+  extends: .python
+  stage: validate
+  script:
+    - python -m mypy
+
+secret_detection:
+  stage: validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+
+# ---------------------------------------------------------------------------
+# build — only when the image inputs change, or on demand.
+# ---------------------------------------------------------------------------
+
+build-image:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+    - changes:
+        - Dockerfile
+        - requirements.txt
+      when: manual
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" -t "$CI_REGISTRY_IMAGE:latest" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE:latest"
+
+
+# ---------------------------------------------------------------------------
+# sync — the synchronization job.
+#
+# `rules` restricts it to `schedule` and `web`, so a push — including the
+# agent's own push — can never start it. The `[skip ci]` marker in the commit
+# message is the second, independent guard against recursion (§11.7).
+#
+# `resource_group` serializes executions so two scheduled runs cannot race on
+# the same branch (§11.8). That is also what makes the amend + force-with-lease
+# state strategy safe (decision D-3).
+#
+# `tags` must name the runner that can reach the Oracle listeners. Uncomment
+# and set it before enabling the schedule, or the job will run on a shared
+# runner with no database access (§19).
+# ---------------------------------------------------------------------------
+
+sync:
+  stage: sync
+  image: $CI_REGISTRY_IMAGE:latest
+  resource_group: oracle-versioning-sync
+  interruptible: false
+  timeout: 2h
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+  variables:
+    # Rebase and push need real history, not a shallow detached snapshot (§19).
+    GIT_DEPTH: "0"
+    GIT_STRATEGY: fetch
+  # tags:
+  #   - oracle-network
+  script:
+    # The agent performs its own staging, commit, and push; this script only
+    # puts the checkout on a real branch first, because CI leaves a detached
+    # HEAD, which cannot be pushed from.
+    - git checkout "$CI_COMMIT_REF_NAME"
+    - git pull --ff-only origin "$CI_COMMIT_REF_NAME"
+    - python -m src.main --log-level "${LOG_LEVEL:-INFO}"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - logs/
+
+# A dry run for merge requests: reports what would change, writes nothing,
+# commits nothing (§20.5). Manual, because it needs database credentials.
+sync-dry-run:
+  extends: sync
+  stage: sync
+  resource_group: null
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: true
+  script:
+    - python -m src.main --dry-run --log-level DEBUG

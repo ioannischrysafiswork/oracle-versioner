@@ -1,0 +1,15 @@
+# Development / CI dependencies. Not installed into the runtime image
+# (docs/architecture.md §18.1 — the image carries only the runtime set).
+
+-r requirements.txt
+
+pytest==9.1.1
+
+# Lint and type check are blocking in CI (CLAUDE.md §6), which needs a
+# toolchain. Both are dev-only — neither is installed into the runtime image —
+# so the runtime dependency set stays exactly `oracledb` + `PyYAML`.
+# Justification for each is in the Phase 7 report; they need ratification
+# against CLAUDE.md §4.
+ruff==0.16.2
+mypy==2.3.0
+types-PyYAML==6.0.12.20260724

@@ -1,0 +1,8 @@
+# Runtime dependencies — fully pinned (docs/architecture.md §18.3).
+#
+# Approved dependency set (CLAUDE.md §4). Anything added here needs owner
+# approval. The python-oracledb driver is published on PyPI under the
+# distribution name "oracledb".
+
+oracledb==4.0.2
+PyYAML==6.0.3

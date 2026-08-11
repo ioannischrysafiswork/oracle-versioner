@@ -1,0 +1,9 @@
+# Exported DDL must be LF everywhere, so that a clone on Windows cannot
+# introduce CRLF diffs (docs/architecture.md §10.2, §10.3).
+* text=auto eol=lf
+*.sql text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf

@@ -1,0 +1,22 @@
+# Logging configuration.
+#
+# The redaction filter is installed on the root logger by
+# src/logging/logger.py and is NOT optional — it cannot be disabled from here.
+#
+# PHASE 2 SKELETON: only `level` is honoured. The JSON formatter and the
+# rotating file sink are read by the logging phase.
+
+level: INFO
+
+# text | json — json is the default in CI so log aggregation can parse it,
+# text is more readable locally.
+format: text
+
+sinks:
+  stdout:
+    enabled: true
+  file:
+    enabled: false
+    path: logs/oracle-versioner.log   # git-ignored; local debugging only
+    max_bytes: 10485760
+    backup_count: 3

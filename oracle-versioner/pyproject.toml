@@ -1,0 +1,80 @@
+# Tool configuration only.
+#
+# The application is not packaged/installed — it is executed as a module
+# (`python -m src.main`) from the repository root, which is what the Docker
+# entrypoint and the GitLab CI job do. There is deliberately no
+# [build-system] / [project] table: adding one would require deciding on a
+# distribution name and layout, which the approved structure
+# (docs/architecture.md §2, CLAUDE.md §3) does not define.
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["."]
+
+[tool.ruff.lint]
+# Chosen to enforce the rules CLAUDE.md §7.3 already states: PEP 8, docstrings
+# on public functions, pathlib over string paths, no bare except, no print.
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # import order
+    "N",         # pep8-naming
+    "D",         # pydocstyle
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "S",         # bandit (security)
+    "A",         # builtin shadowing
+    "C4",        # comprehensions
+    "PTH",       # pathlib over os.path
+    "RET",       # return simplification
+    "SIM",       # simplification
+    "T20",       # no print()
+    "TID",       # tidy imports
+    "RUF",       # ruff-specific
+]
+ignore = [
+    "D203",    # incompatible with D211, which we keep
+    "D213",    # incompatible with D212, which we keep
+    "E501",    # line length is enforced by the formatter setting above
+    "SIM105",  # contextlib.suppress is not clearer than try/except/pass here
+    "SIM905",  # a 100-word keyword list reads far better as a split string
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: asserts are the point of them, scripted fakes need no docstrings, and
+# invoking `git` by name is exactly what the code under test does.
+"tests/*" = [
+    "S101", "S105", "S106", "S603", "S607",
+    "D100", "D101", "D102", "D103", "D105", "D107",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.13"
+files = ["src"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = "oracledb.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "oracle: requires a live Oracle instance; skipped by default (docs/architecture.md §17.1)",
+    "integration: requires network or a real Git remote; skipped by default",
+]
+filterwarnings = ["error"]

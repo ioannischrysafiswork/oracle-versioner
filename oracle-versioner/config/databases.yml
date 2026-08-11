@@ -1,0 +1,36 @@
+# Oracle databases to synchronize.
+#
+# SECRET NAMES ONLY — never secret values (CLAUDE.md §5.3).
+# The *_env keys name environment variables / CI-CD variables that a
+# SecretProvider resolves at runtime. Committing a DSN, username, or password
+# here is a security incident.
+#
+# The example below is commented out: an empty database list is a valid
+# configuration and makes the agent a no-op, which is the correct default for a
+# repository that has not been pointed at a real database yet.
+
+databases: []
+
+# - name: HRDB
+#   git_folder: HRDB              # subfolder under repository/
+#   dsn_env: HRDB_DSN
+#   username_env: HRDB_USER
+#   password_env: HRDB_PASSWORD
+#   enabled: true
+#   thick_mode: false             # thin mode is the default (no Instant Client)
+#   schemas:
+#     include: [HR, PAYROLL]      # empty include = every schema not excluded
+#     exclude: []
+#   object_types:                 # omit for all twelve supported types
+#     - PACKAGE
+#     - PACKAGE BODY
+#     - PROCEDURE
+#     - FUNCTION
+#     - TRIGGER
+#     - TYPE
+#     - TYPE BODY
+#     - VIEW
+#     - TABLE
+#     - SEQUENCE
+#     - SYNONYM
+#     - MATERIALIZED VIEW

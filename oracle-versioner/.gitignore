@@ -1,0 +1,49 @@
+# Secrets — never commit (CLAUDE.md §5.6, docs/architecture.md §21.5)
+.env
+.env.*
+!.env.example
+*.ora
+tnsnames.ora
+sqlnet.ora
+ldap.ora
+wallet/
+wallets/
+*.p12
+*.pem
+*.key
+
+# Logs (local debugging only). The directory is tracked, its contents are not:
+# a bare `logs/` rule would also swallow the placeholder and drop the directory
+# from the repository.
+logs/*
+!logs/.gitkeep
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
