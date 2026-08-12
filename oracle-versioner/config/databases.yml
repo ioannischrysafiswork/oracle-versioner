@@ -9,7 +9,23 @@
 # configuration and makes the agent a no-op, which is the correct default for a
 # repository that has not been pointed at a real database yet.
 
-databases: []
+databases:
+  - name: FREEPDB1
+    git_folder: FREEPDB1
+    dsn_env: ORA_DSN
+    username_env: ORA_USER
+    password_env: ORA_PASSWORD
+    enabled: false               # local disposable container; re-enable to switch back
+    schemas:
+      include: [HR_DEMO]
+
+  - name: CLIENT_DEV
+    git_folder: CLIENT_DEV
+    dsn_env: CLIENTDB_DSN
+    username_env: CLIENTDB_USER
+    password_env: CLIENTDB_PASSWORD
+    schemas:
+      include: [ APP_SCHEMA_2 ]                # <-- TODO: put a schema name here before running
 
 # - name: HRDB
 #   git_folder: HRDB              # subfolder under repository/
