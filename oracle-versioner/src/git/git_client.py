@@ -117,6 +117,31 @@ class GitClient:
         name = self.run(["rev-parse", "--abbrev-ref", "HEAD"], check=False)
         return "" if name in ("HEAD", "") else name
 
+    def remote_head(self, remote: str, branch: str) -> str:
+        """Return the SHA ``branch`` points to on ``remote``.
+
+        Talks to the remote directly (``ls-remote``) rather than trusting a
+        local remote-tracking ref, which is only ever as fresh as the last
+        fetch. Used to detect a commit that a previous run made locally but
+        never managed to push — see :meth:`~src.workflow.git_phase.GitPhase.run`.
+
+        Args:
+            remote: The remote name, e.g. ``origin``.
+            branch: The branch name, e.g. ``main``.
+
+        Returns:
+            The SHA, or ``""`` if the branch does not exist on the remote yet.
+
+        Raises:
+            GitError: If the remote cannot be reached at all.
+        """
+        output = self.run(["ls-remote", remote, f"refs/heads/{branch}"])
+        return output.split()[0] if output else ""
+
+    def commit_message(self, ref: str = "HEAD") -> str:
+        """Return the full commit message of ``ref``, verbatim."""
+        return self.run(["log", "-1", "--pretty=%B", ref])
+
     def ensure_branch(self, branch: str) -> None:
         """Make sure work happens on ``branch`` rather than a detached HEAD.
 

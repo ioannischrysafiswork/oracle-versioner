@@ -14,6 +14,17 @@ the design::
 
 A watermark can therefore never advance past changes that did not reach GitLab.
 
+**Recovering a commit stranded by an earlier failed push.** If a previous
+execution committed locally and then failed to push (a network fault, the
+wrong remote configured, an expired token), that commit sits on ``HEAD``
+indefinitely. Architecture §22.7 assumes the *next* run will naturally
+re-extract the same objects and produce a fresh diff to push — but that is
+false whenever the re-extracted content is byte-identical to what is already
+committed, which is the common case. Left unhandled, the stranded commit would
+never be retried. :meth:`GitPhase.run` checks the remote's actual ``HEAD``
+before deciding there is nothing to do, and pushes an existing unpushed commit
+even when this run wrote nothing new.
+
 Extracted from :mod:`src.workflow.pipeline` so that module orchestrates the
 extraction phase and delegates this one, mirroring the two stages §1.2 defines.
 **Not in the approved structure** (CLAUDE.md §3); see the Phase 6 report.
@@ -23,17 +34,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.config.models import AppConfig
+from src.config.models import AppConfig, GitSettings
 from src.config.secrets import SecretProvider
 from src.exceptions import GitError
 from src.git.commit import CommitBuilder
 from src.git.git_client import GitClient
-from src.git.push import Pusher
+from src.git.push import Pusher, is_retryable_push_failure
 from src.logging.logger import get_logger
 from src.models.execution import ExecutionResult
 from src.repository.file_mapper import FileMapper
 from src.state.execution_state import ExecutionStateStore
 from src.state.models import ExecutionState
+from src.utils.retry import RetryPolicy, retry_call
 from src.utils.timers import utc_now
 
 __all__ = ["GitPhase"]
@@ -93,49 +105,94 @@ class GitPhase:
 
         written = [path for unit in result.run_units for path in unit.written_paths]
         deleted = [path for unit in result.run_units for path in unit.deleted_paths]
-        if not written and not deleted:
-            _log.info("nothing to stage; no commit, no push, and state is left untouched")
-            return False
 
         git = self.config.settings.git
         self.client.ensure_branch(git.branch)
         self.client.configure_identity(git.author_name, git.author_email)
 
+        local_sha = self.client.rev_parse("HEAD")
         builder = CommitBuilder(self.client, self.mappers)
-        try:
-            CommitBuilder.stage(self.client, written, deleted)
+        message = ""
+        made_new_commit = False
 
-            # The empty-commit gate (§11.4). Files were written, but if they are
-            # byte-identical to what is committed, Git reports nothing staged —
-            # which is exactly how a recompilation-only run stays silent.
-            if not builder.has_staged_changes():
+        if written or deleted:
+            try:
+                CommitBuilder.stage(self.client, written, deleted)
+
+                # The empty-commit gate (§11.4). Files were written, but if
+                # they are byte-identical to what is committed, Git reports
+                # nothing staged — which is exactly how a recompilation-only
+                # run stays silent.
+                if builder.has_staged_changes():
+                    result.finished_at = utc_now()
+                    # Built once, here, while the DDL changes are still in the
+                    # index. The amend in _persist_state re-uses this text:
+                    # rebuilding it there would describe an index holding
+                    # nothing but the state file, and since the amend replaces
+                    # the message, the object list would vanish from the
+                    # commit that is actually published.
+                    message = builder.build_message(result, local_sha)
+                    self.client.commit(message)
+                    made_new_commit = True
+            except GitError:
+                # Leave no half-staged index behind, so the next execution
+                # starts from a clean working tree (§14.4). The reset is
+                # `--mixed`: it unstages without discarding extracted files.
+                self.client.run(["reset"], check=False)
+                raise
+
+        if not made_new_commit:
+            # Nothing new was staged this run. Before concluding there is
+            # nothing to do, check whether HEAD is already ahead of the remote
+            # from an earlier run whose push failed — checked only here, not
+            # on every run, and retried like any other network operation
+            # against the remote (a transient blip must not abort the whole
+            # phase on the very first attempt).
+            remote_sha = self._remote_head_with_retry(git)
+            if local_sha == remote_sha:
                 _log.info("no effective change; no commit, no push, and state is left untouched")
                 return False
-
-            previous_sha = self.client.rev_parse("HEAD")
-            result.finished_at = utc_now()
-            # Built once, here, while the DDL changes are still in the index.
-            # The amend below re-uses this text: rebuilding it there would
-            # describe an index holding nothing but the state file, and since
-            # the amend replaces the message, the object list would vanish from
-            # the commit that is actually published.
-            message = builder.build_message(result, previous_sha)
-            self.client.commit(message)
-        except GitError:
-            # Leave no half-staged index behind, so the next execution starts
-            # from a clean working tree (§14.4). The reset is `--mixed`: it
-            # unstages without discarding the extracted files.
-            self.client.run(["reset"], check=False)
-            raise
+            _log.info("HEAD has an unpushed commit from a previous run; pushing it")
+            message = self.client.commit_message("HEAD")
 
         pusher = Pusher(self.client, git, self.config.settings.retry, self.secret_provider)
         pushed_sha = pusher.push()
         result.commit_sha = pushed_sha
         result.pushed = True
-        _log.info("pushed %s to %s (previous %s)", pushed_sha, git.branch, previous_sha or "-")
+        _log.info("pushed %s to %s", pushed_sha, git.branch)
 
         self._persist_state(result, message, pusher, pushed_sha)
         return True
+
+    def _remote_head_with_retry(self, git: GitSettings) -> str:
+        """:meth:`GitClient.remote_head`, retried with the push retry policy.
+
+        Args:
+            git: Branch, remote, and retry settings.
+
+        Returns:
+            The SHA ``git.branch`` points to on ``git.remote``, or ``""``.
+
+        Raises:
+            src.exceptions.GitError: If the remote is still unreachable once
+                the retry budget is exhausted.
+        """
+        retry = self.config.settings.retry
+        policy = RetryPolicy(
+            attempts=retry.push_attempts,
+            base_delay=retry.push_backoff_seconds,
+            jitter_ratio=retry.jitter_ratio,
+        )
+        return retry_call(
+            lambda: self.client.remote_head(git.remote, git.branch),
+            policy=policy,
+            is_retryable=is_retryable_push_failure,
+            description="check remote HEAD",
+            on_retry=lambda attempt, delay, exc: _log.warning(
+                "checking remote HEAD attempt %d failed (%s); retrying in %.1fs",
+                attempt, exc, delay,
+            ),
+        )
 
     def _persist_state(
         self,

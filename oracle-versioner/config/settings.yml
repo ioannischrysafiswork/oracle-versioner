@@ -53,7 +53,7 @@ retry:
 
 git:
   branch: main
-  remote: origin
+  remote: gitlab
   author_name: oracle-versioning-bot
   author_email: oracle-versioning-bot@example.invalid
   token_env: GIT_PUSH_TOKEN     # name only — the token comes from a CI/CD variable

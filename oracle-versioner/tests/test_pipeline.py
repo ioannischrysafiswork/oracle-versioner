@@ -590,6 +590,62 @@ def test_state_is_not_advanced_when_the_push_fails(tmp_path: Path) -> None:
     assert not pipeline.state_store.path.exists()
 
 
+def test_a_commit_stranded_by_an_earlier_failed_push_is_recovered(tmp_path: Path) -> None:
+    """Regression: found live against a real database.
+
+    A run committed locally and then failed to push (wrong remote configured).
+    The next run re-extracted identical content, so nothing new was staged —
+    and the old code concluded "nothing to do" without ever noticing HEAD was
+    still sitting unpushed. The commit would have been stranded forever, since
+    architecture §22.7's recovery story assumes the next run always produces a
+    fresh diff, which is false whenever content is unchanged.
+    """
+    import subprocess
+
+    repo, remote = _repo_with_remote(tmp_path)
+
+    # Simulate the first run's local commit succeeding but its push failing:
+    # commit for real, but never push, exactly like a PushError would leave
+    # things (git_phase resets the index on failure, but the commit itself
+    # already exists by the time push is attempted).
+    stranded = _git_pipeline(repo, _package_session("EMP_PKG"))
+    written = stranded._extraction_phase(stranded.config.enabled_databases)
+    from src.workflow.git_phase import GitPhase
+
+    phase = GitPhase(
+        stranded.config, stranded.state, stranded.state_store,
+        stranded._mappers(), stranded.git_client, stranded.secret_provider,
+    )
+    from src.models.execution import ExecutionResult
+
+    result = ExecutionResult(execution_id="stranded", run_units=written)
+    from src.git.commit import CommitBuilder
+
+    builder = CommitBuilder(stranded.git_client, phase.mappers)
+    written_paths = [p for u in written for p in u.written_paths]
+    CommitBuilder.stage(stranded.git_client, written_paths, [])
+    stranded.git_client.commit(builder.build_message(result, ""))
+    # Deliberately no push here — this is the stranded state.
+
+    stranded_sha = stranded.git_client.rev_parse("HEAD")
+    remote_before = subprocess.run(
+        ["git", "rev-parse", "refs/heads/main"], cwd=remote,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert stranded_sha != remote_before  # confirms the stranding actually happened
+
+    # The next run re-extracts identical content: nothing new to stage.
+    recovering = _git_pipeline(repo, _package_session("EMP_PKG"))
+    recovering.run()
+
+    remote_after = subprocess.run(
+        ["git", "rev-parse", "refs/heads/main"], cwd=remote,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert remote_after != remote_before  # the remote moved
+    assert recovering.state_store.saved is True  # and state finally advanced
+
+
 @pytest.mark.parametrize(
     ("statuses", "expected", "exit_code"),
     [

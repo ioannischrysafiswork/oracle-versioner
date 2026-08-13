@@ -444,3 +444,33 @@ def test_ensure_branch_is_a_no_op_when_already_correct(client: GitClient) -> Non
     before = client.rev_parse("HEAD")
     client.ensure_branch("main")
     assert client.rev_parse("HEAD") == before
+
+
+# --------------------------------------------------------------------------- remote_head / commit_message
+
+
+def test_remote_head_matches_a_real_push(client: GitClient, repo: Path, remote: Path) -> None:
+    """The whole point: this must reflect the remote's actual state, not a cache."""
+    client.add([_write(repo, "a.sql")])
+    pushed = client.commit("add a\n")
+    _git(repo, "push", "origin", "main")
+    assert client.remote_head("origin", "main") == pushed
+
+
+def test_remote_head_is_empty_for_a_branch_that_does_not_exist(client: GitClient) -> None:
+    """A not-yet-pushed branch must not be confused with a connectivity failure."""
+    assert client.remote_head("origin", "no-such-branch") == ""
+
+
+def test_remote_head_raises_when_the_remote_is_unreachable(client: GitClient) -> None:
+    """Cannot reach the remote at all is different from "branch absent"."""
+    client.run(["remote", "set-url", "origin", "https://127.0.0.1:1/nope.git"])
+    with pytest.raises(GitError):
+        client.remote_head("origin", "main")
+
+
+def test_commit_message_round_trips_verbatim(client: GitClient, repo: Path) -> None:
+    """The exact text is needed to preserve a stranded commit's message."""
+    client.add([_write(repo, "a.sql")])
+    client.commit("subject line\n\nbody with detail\n")
+    assert client.commit_message("HEAD") == "subject line\n\nbody with detail"
