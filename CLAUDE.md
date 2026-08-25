@@ -34,6 +34,8 @@ unnecessary commits: writing byte-identical content produces no diff, so no comm
 The system is incremental, stateless, read-only against Oracle, and runs entirely inside
 GitLab CI/CD with no permanently running server.
 
+more details regarding the structure , architecture and functionality of each component on @SPEC.MD
+
 ---
 
 ## 2. Approved architecture

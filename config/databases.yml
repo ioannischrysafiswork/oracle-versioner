@@ -25,7 +25,7 @@ databases:
     username_env: CLIENTDB_USER
     password_env: CLIENTDB_PASSWORD
     schemas:
-      include: [ APP_SCHEMA_3 ]                # <-- TODO: put a schema name here before running
+      include: [ APP_SCHEMA_1 ]                # <-- TODO: put a schema name here before running
 
 # - name: HRDB
 #   git_folder: HRDB              # subfolder under repository/
