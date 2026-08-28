@@ -2,7 +2,7 @@
 #
 # The jobs are thin wrappers: everything meaningful lives in the application,
 # so the same behaviour is reproducible locally with `python -m src.main`.
-
+# runner specs: --executor: docker  --default docker image: python:3.13-slim
 stages:
   - validate
   - build
@@ -41,8 +41,8 @@ unit-tests:
   stage: validate
   before_script:
     - apt-get update && apt-get install --no-install-recommends -y git
-    - git config --global user.email "ci@example.invalid"
-    - git config --global user.name "CI"
+    - git config --global user.email "developer@example.com"
+    - git config --global user.name "CHRYSAFIS Ioannis"
     - pip install -r requirements-dev.txt
   script:
     # Includes the two tests CLAUDE.md §6 marks blocking: the read-only SQL
@@ -52,7 +52,7 @@ unit-tests:
     when: always
     reports:
       junit: report.xml
-    expire_in: 30 days
+    expire_in: 7 days
 
 lint:
   extends: .python
@@ -126,7 +126,9 @@ sync:
     # Rebase and push need real history, not a shallow detached snapshot (§19).
     GIT_DEPTH: "0"
     GIT_STRATEGY: fetch
-  # tags:
+  tags:
+      - ci_versioner 
+      - ssh
   #   - oracle-network
   script:
     # The agent performs its own staging, commit, and push; this script only
@@ -137,7 +139,7 @@ sync:
     - python -m src.main --log-level "${LOG_LEVEL:-INFO}"
   artifacts:
     when: always
-    expire_in: 30 days
+    expire_in: 7 days
     paths:
       - logs/
 

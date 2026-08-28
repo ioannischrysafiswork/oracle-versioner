@@ -19,6 +19,10 @@ logs/*
 !logs/.gitkeep
 *.log
 
+# Local gitlab-runner registration state — specific to one machine's install,
+# not application source.
+.runner_system_id
+
 # Python
 __pycache__/
 *.py[cod]
