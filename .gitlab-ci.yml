@@ -100,6 +100,13 @@ build-image:
   tags:
     - ci_versioner
   rules:
+    # Without a Container Registry on the instance, $CI_REGISTRY is empty and
+    # `docker login -u X -p Y ""` silently targets Docker Hub, failing with an
+    # "unauthorized" from registry-1.docker.io that looks like a credential
+    # problem but is not one. Offering an unrunnable job is worse than hiding
+    # it. This job additionally needs a runner in privileged mode for dind.
+    - if: $CI_REGISTRY == null || $CI_REGISTRY == ""
+      when: never
     - if: $CI_PIPELINE_SOURCE == "web"
       when: manual
     - changes:
@@ -131,7 +138,14 @@ build-image:
 
 sync:
   stage: sync
-  image: $CI_REGISTRY_IMAGE:latest
+  # The Dockerfile image would be the right thing to run here, but this
+  # instance has no Container Registry to host it and the runner is not
+  # privileged, so it can be neither built nor pulled (see `build-image`).
+  # `python:3.13-slim` plus the runtime requirements is the same environment
+  # by another route, and it is the image the validate jobs already prove
+  # works on this runner. Restore `image: $CI_REGISTRY_IMAGE:latest` once a
+  # registry exists.
+  image: $PYTHON_IMAGE
   resource_group: oracle-versioning-sync
   interruptible: false
   timeout: 2h
@@ -160,6 +174,8 @@ sync:
   #
   # ORG_ROOT_CA is a file-type CI/CD variable holding the certificate.
   before_script:
+    - apt-get update && apt-get install --no-install-recommends -y git ca-certificates
+    - pip install -r requirements.txt
     - git config --global http.sslCAInfo "$ORG_ROOT_CA"
   script:
     # The agent performs its own staging, commit, and push; this script only
