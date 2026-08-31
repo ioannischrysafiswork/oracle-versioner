@@ -1,13 +1,18 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "databases": {
     "CLIENT_DEV": {
       "database_name": "CLIENT_DEV",
-      "last_successful_run": "2026-08-31T07:54:38.286542+00:00",
-      "commit_sha": "296cace2ebe1b6974123edd8c319633b015b3a86",
-      "execution_status": "SUCCESS",
-      "processed_objects": 3407,
-      "execution_duration_seconds": 153.122664
+      "schemas": {
+        "APP_SCHEMA_1": {
+          "schema_name": "APP_SCHEMA_1",
+          "last_successful_run": "2026-08-31T09:43:50.261901+00:00",
+          "commit_sha": null,
+          "execution_status": "SUCCESS",
+          "processed_objects": 3407,
+          "execution_duration_seconds": 150.30632
+        }
+      }
     }
   }
 }
