@@ -130,6 +130,20 @@ sync:
       - ci_versioner 
       - ssh
   #   - oracle-network
+  # The runtime image's ca-certificates bundle does not carry the organization
+  # root CA, so every HTTPS git operation from inside it fails with
+  # "certificate signer not trusted" (docs/manual-test-commands.md #9).
+  #
+  # `git config --global` rather than an env var: GitClient.run() hands each
+  # git subprocess a minimal environment — GIT_TERMINAL_PROMPT, PATH, HOME —
+  # so GIT_SSL_CAINFO would be stripped before git ever saw it. HOME *is*
+  # forwarded, so $HOME/.gitconfig reaches the application's pushes as well as
+  # this job's own `git pull`. It also needs no root, which matters because the
+  # image runs as the non-root `agent` user.
+  #
+  # ORG_ROOT_CA is a file-type CI/CD variable holding the certificate.
+  before_script:
+    - git config --global http.sslCAInfo "$ORG_ROOT_CA"
   script:
     # The agent performs its own staging, commit, and push; this script only
     # puts the checkout on a real branch first, because CI leaves a detached

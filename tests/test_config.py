@@ -327,7 +327,15 @@ def test_dry_run_and_no_git_reach_the_configuration(config_dir: Path) -> None:
 
 
 def test_shipped_config_directory_loads(project_root: Path) -> None:
-    """The config/ files committed to this repository are themselves valid."""
+    """The config/ files committed to this repository are themselves valid.
+
+    Deliberately *not* asserted empty. An operator points `databases.yml` at
+    real databases, and this test has to keep passing when they do. What must
+    hold is that whatever is committed parses and validates, that no two
+    databases share a name, and that `settings.yml` still equals the built-in
+    defaults it documents itself as mirroring — a drift there means an
+    operator changed behaviour while believing they had not.
+    """
     config = ConfigLoader(project_root / "config", secret_provider=FakeSecretProvider()).load()
-    assert config.databases == ()
+    assert len({db.name for db in config.databases}) == len(config.databases)
     assert config.settings == Settings()

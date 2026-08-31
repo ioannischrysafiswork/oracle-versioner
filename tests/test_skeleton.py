@@ -15,7 +15,6 @@ import pytest
 import src
 from src.main import build_parser, main
 from src.models.execution import ExitCode
-from tests.conftest import PROJECT_ROOT
 
 ALL_MODULES = [
     "src.exceptions",
@@ -115,9 +114,18 @@ def test_cli_defaults() -> None:
 def test_application_runs_end_to_end_and_exits_zero(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """`python -m src.main --dry-run` completes and reports success."""
+    """`python -m src.main --dry-run` completes and reports success.
+
+    Against a configuration of its own rather than the shipped `config/`:
+    once that is pointed at a real database, loading it needs credentials
+    from the environment, and this test would then fail for a reason with
+    nothing to do with the skeleton it exists to check.
+    """
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "databases.yml").write_text("databases: []\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    assert main(["--dry-run", "--config-dir", str(PROJECT_ROOT / "config")]) == ExitCode.SUCCESS
+    assert main(["--dry-run", "--config-dir", str(config_dir)]) == ExitCode.SUCCESS
 
 
 def test_invalid_configuration_exits_two(
@@ -129,11 +137,20 @@ def test_invalid_configuration_exits_two(
 
 
 def test_unparseable_state_exits_two(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """A corrupt state file is fatal and is not silently recreated."""
+    """A corrupt state file is fatal and is not silently recreated.
+
+    Uses its own configuration for the same reason as the end-to-end test
+    above: read against the shipped `config/`, this would exit 2 because the
+    configuration failed to load, not because the state file is corrupt, and
+    would stay green while proving nothing.
+    """
     monkeypatch.chdir(tmp_path)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "databases.yml").write_text("databases: []\n", encoding="utf-8")
     state = tmp_path / "state" / "execution_state.json"
     state.parent.mkdir()
     state.write_text("{corrupt", encoding="utf-8")
-    exit_code = main(["--config-dir", str(PROJECT_ROOT / "config")])
+    exit_code = main(["--config-dir", str(config_dir)])
     assert exit_code == ExitCode.CONFIGURATION
     assert state.read_text(encoding="utf-8") == "{corrupt"
