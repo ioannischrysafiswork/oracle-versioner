@@ -11,6 +11,14 @@
           "execution_status": "SUCCESS",
           "processed_objects": 3407,
           "execution_duration_seconds": 150.30632
+        },
+        "APP_SCHEMA_2": {
+          "schema_name": "APP_SCHEMA_2",
+          "last_successful_run": "2026-08-31T09:46:21.848097+00:00",
+          "commit_sha": null,
+          "execution_status": "SUCCESS",
+          "processed_objects": 3324,
+          "execution_duration_seconds": 119.110167
         }
       }
     }
