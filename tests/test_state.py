@@ -197,7 +197,16 @@ def test_store_records_whether_it_saved(tmp_path: Path) -> None:
 
 
 def test_committed_state_file_parses(project_root: Path) -> None:
-    """The state/execution_state.json in this repository is valid."""
+    """The state/execution_state.json in this repository is valid.
+
+    Deliberately *not* asserted empty. Every successful run advances this
+    file and commits it, so an emptiness assertion holds only until the
+    agent runs once — after which it fails the very pipeline that produced
+    it. What must hold is that the committed file still parses at the
+    current schema version and that each entry is keyed by its own database
+    name, since a mismatch there would read a watermark back for the wrong
+    database and silently skip changes.
+    """
     state = ExecutionStateStore(project_root / "state" / "execution_state.json").load()
     assert state.schema_version == STATE_SCHEMA_VERSION
-    assert state.databases == {}
+    assert all(name == db.database_name for name, db in state.databases.items())

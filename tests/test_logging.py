@@ -220,7 +220,14 @@ def test_reconfiguring_does_not_duplicate_handlers(tmp_path: Path) -> None:
 
 
 def test_shipped_logging_config_parses(project_root: Path) -> None:
-    """The logging.yml committed to this repository is valid."""
+    """The logging.yml committed to this repository is valid.
+
+    Asserts the shape the loader depends on, not the operator's chosen
+    values. The level and the file-sink switch are theirs to change; pinning
+    them here turns an ordinary configuration edit into a CI failure, which
+    is the same trap the shipped-config and committed-state tests fell into.
+    """
     config = load_logging_config(project_root / "config" / "logging.yml")
-    assert config["level"] == "INFO"
-    assert config["sinks"]["file"]["enabled"] is False
+    assert config["level"] in {"DEBUG", "INFO", "WARNING", "ERROR"}
+    assert config["format"] in {"text", "json"}
+    assert isinstance(config["sinks"]["file"]["enabled"], bool)
