@@ -145,6 +145,41 @@ class CommitBuilder:
 
         return subject + "\n" + "\n".join(body) + "\n"
 
+    def build_watermark_message(self, unit: RunUnitResult, previous_sha: str) -> str:
+        """Render the message for a schema recording its first watermark.
+
+        A deliberately different subject from a DDL commit (decision D-19):
+        this commit carries only the state file, and labelling it "Updated
+        Oracle objects" with an empty object list would misrepresent it in
+        every log and blame view forever.
+
+        Args:
+            unit: The completed run unit for the schema.
+            previous_sha: HEAD before this commit, for the body.
+
+        Returns:
+            Subject and body, carrying the ``[skip ci]`` marker.
+        """
+        stamp = unit.finished_at or unit.started_at
+        timestamp = to_utc(stamp).isoformat() if stamp else ""
+        watermark = unit.candidate_watermark
+        subject = (
+            f"{unit.database}.{unit.schema}||{timestamp}: "
+            f"Recorded initial watermark {SKIP_CI_MARKER}"
+        )
+        body = [
+            "",
+            f"Objects discovered : {unit.objects_discovered}",
+            "Objects changed    : 0",
+            f"Watermark recorded : {to_utc(watermark).isoformat() if watermark else '-'}",
+            f"Previous commit    : {previous_sha or '-'}",
+            "",
+            "No DDL changed. This schema was already in sync but held no watermark, so",
+            "every run would otherwise re-export it in full and record nothing. Recording",
+            "it here makes subsequent runs incremental (docs/architecture.md decision D-19).",
+        ]
+        return subject + "\n" + "\n".join(body) + "\n"
+
     @staticmethod
     def stage(client: GitClient, written: Iterable[Path], deleted: Iterable[Path]) -> None:
         """Stage exactly the paths this execution touched.

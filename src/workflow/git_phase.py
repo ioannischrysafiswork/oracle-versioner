@@ -8,7 +8,9 @@ The ordering is decision D-3 as amended by D-17, and it is the single most
 important rule in the design::
 
     stage this schema's written files + its reconciliation deletions
-    nothing staged        -> no commit, no push, watermark untouched
+    nothing staged        -> no commit, unless this schema has no watermark
+                             yet, in which case it records its first one in a
+                             state-only commit (decision D-19)
     commit -> push        -> if this fails, nothing has been persisted
     write this schema's state -> amend -> force-push under a lease
 
@@ -151,11 +153,7 @@ class GitPhase:
             return True
 
         if not (unit.written_paths or unit.deleted_paths):
-            _log.info(
-                "%s.%s: nothing written or deleted; no commit, watermark untouched",
-                unit.database, unit.schema,
-            )
-            return False
+            return self._record_initial_watermark(unit)
 
         git = self.config.settings.git
         local_sha = self.client.rev_parse("HEAD")
@@ -169,12 +167,7 @@ class GitPhase:
             # staged — which is exactly how a recompilation-only run stays
             # silent, per schema.
             if not builder.has_staged_changes():
-                _log.info(
-                    "%s.%s: no effective change; no commit, no push, and the watermark "
-                    "is left untouched",
-                    unit.database, unit.schema,
-                )
-                return False
+                return self._record_initial_watermark(unit)
 
             unit.finished_at = utc_now()
             # Built once, here, while this schema's DDL changes are still in
@@ -198,6 +191,71 @@ class GitPhase:
         _log.info("%s.%s: pushed %s to %s", unit.database, unit.schema, pushed_sha, git.branch)
 
         self._persist_state(unit, message, pusher, pushed_sha)
+        return True
+
+    def _record_initial_watermark(self, unit: RunUnitResult) -> bool:
+        """Record a first watermark for a schema that is already in sync.
+
+        Decision D-19. State is otherwise written only when a commit happens,
+        and that rule alone leaves an already-synchronized schema permanently
+        un-watermarked: it exports in full, produces no diff, records nothing,
+        and repeats forever. A schema holding no watermark therefore records
+        one here, in a commit carrying only the state file. A schema that
+        already has one keeps the old rule and stays silent, so the churn is
+        bounded at one commit per schema, ever.
+
+        Args:
+            unit: The completed run unit, updated in place on success.
+
+        Returns:
+            ``True`` when a state-only commit was pushed, ``False`` when there
+            was genuinely nothing to do.
+
+        Raises:
+            src.exceptions.GitError: On commit or push failure.
+        """
+        if self.state.watermark_for(unit.database, unit.schema) is not None:
+            _log.info(
+                "%s.%s: no effective change; no commit, no push, and the watermark "
+                "is left untouched",
+                unit.database, unit.schema,
+            )
+            return False
+
+        if unit.candidate_watermark is None:
+            # Nothing was read from the database clock, so there is no honest
+            # value to record. Never substitute the runner clock (§4.2).
+            return False
+
+        _log.info(
+            "%s.%s: already in sync but holds no watermark; recording one so later runs "
+            "are incremental (decision D-19)",
+            unit.database, unit.schema,
+        )
+        unit.finished_at = unit.finished_at or utc_now()
+        previous_sha = self.client.rev_parse("HEAD")
+
+        # commit_sha is None: no DDL landed in this commit, and claiming one
+        # would misdescribe it.
+        self.state = self.state.advanced_by(unit, None)
+        self.state_store.save(self.state)
+        self.client.add([Path(self.state_store.path)])
+
+        builder = CommitBuilder(self.client, self.mappers)
+        if not builder.has_staged_changes():
+            return False
+
+        message = builder.build_watermark_message(unit, previous_sha)
+        self.client.commit(message)
+
+        git = self.config.settings.git
+        pusher = Pusher(self.client, git, self.config.settings.retry, self.secret_provider)
+        unit.commit_sha = pusher.push()
+        unit.pushed = True
+        _log.info(
+            "%s.%s: watermark commit %s pushed to %s",
+            unit.database, unit.schema, unit.commit_sha, git.branch,
+        )
         return True
 
     def _remote_head_with_retry(self, git: GitSettings) -> str:

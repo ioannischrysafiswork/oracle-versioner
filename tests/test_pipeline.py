@@ -566,7 +566,10 @@ def _git_pipeline(repo: Path, session: FakeSession, **flags):
     store = ExecutionStateStore(repo / "state" / "execution_state.json")
     return Pipeline(
         config,
-        ExecutionState(),
+        # Loaded, not empty: a second run must see what the first one wrote, or
+        # it behaves like an amnesiac and re-records watermarks production
+        # would already have.
+        store.load(),
         store,
         execution_id="test",
         connection_factory=FakeConnectionFactory(session=session),
@@ -654,6 +657,80 @@ def test_state_is_not_advanced_when_the_push_fails(tmp_path: Path) -> None:
     assert issubclass(PushError, Exception)
 
 
+def test_an_in_sync_schema_records_its_first_watermark(tmp_path: Path) -> None:
+    """Decision D-19, and the reason it exists.
+
+    Reproduced live: after the v1 state migration discarded its watermark, a
+    schema whose files were already committed exported in full, produced no
+    diff, recorded nothing, and would have repeated that on every run forever
+    — 6,700 objects and five minutes to accomplish nothing.
+    """
+    repo, _ = _repo_with_remote(tmp_path)
+
+    # First run: commits the DDL and records the watermark normally.
+    first = _git_pipeline(repo, _package_session("EMP_PKG"))
+    first.run()
+    recorded = first.state.watermark_for("HRDB", "HR")
+    assert recorded is not None
+
+    # Now simulate the post-migration state: the files are committed and
+    # current, but the watermark is gone.
+    first.state_store.save(ExecutionState())
+    first.git_client.add([Path(first.state_store.path)])
+    first.git_client.commit("drop the watermark" + chr(92) + "n")
+
+    second = _git_pipeline(repo, _package_session("EMP_PKG"))
+    result = second.run()
+
+    assert second.state.watermark_for("HRDB", "HR") is not None
+    assert result.pushed is True
+    message = second.git_client.commit_message("HEAD")
+    assert "Recorded initial watermark" in message
+    assert "Updated Oracle objects" not in message
+
+
+def test_the_watermark_commit_carries_only_the_state_file(tmp_path: Path) -> None:
+    """It is a state-only commit; no DDL is claimed to have changed."""
+    import subprocess
+
+    repo, remote = _repo_with_remote(tmp_path)
+    first = _git_pipeline(repo, _package_session("EMP_PKG"))
+    first.run()
+    first.state_store.save(ExecutionState())
+    first.git_client.add([Path(first.state_store.path)])
+    first.git_client.commit("drop the watermark" + chr(92) + "n")
+
+    _git_pipeline(repo, _package_session("EMP_PKG")).run()
+
+    files = subprocess.run(
+        ["git", "show", "--name-only", "--pretty=", "refs/heads/main"], cwd=remote,
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    assert files == ["state/execution_state.json"]
+
+
+def test_a_schema_that_already_has_a_watermark_stays_silent(tmp_path: Path) -> None:
+    """The churn is bounded: one watermark commit per schema, ever."""
+    import subprocess
+
+    repo, remote = _repo_with_remote(tmp_path)
+    _git_pipeline(repo, _package_session("EMP_PKG")).run()
+    before = subprocess.run(
+        ["git", "rev-parse", "refs/heads/main"], cwd=remote,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    result = _git_pipeline(repo, _package_session("EMP_PKG")).run()
+
+    after = subprocess.run(
+        ["git", "rev-parse", "refs/heads/main"], cwd=remote,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert after == before
+    assert result.status is ExecutionStatus.NO_CHANGES
+    assert result.pushed is False
+
+
 def test_a_commit_stranded_by_an_earlier_failed_push_is_recovered(tmp_path: Path) -> None:
     """Regression: found live against a real database.
 
@@ -674,6 +751,12 @@ def test_a_commit_stranded_by_an_earlier_failed_push_is_recovered(tmp_path: Path
             ["git", "rev-parse", "refs/heads/main"], cwd=cwd,
             capture_output=True, text=True, check=True,
         ).stdout.strip()
+
+    def git_log(cwd: Path) -> list[str]:
+        return subprocess.run(
+            ["git", "log", "--pretty=%H", "refs/heads/main"], cwd=cwd,
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
 
     repo, remote = _repo_with_remote(tmp_path)
 
@@ -697,7 +780,9 @@ def test_a_commit_stranded_by_an_earlier_failed_push_is_recovered(tmp_path: Path
     recovering = _git_pipeline(repo, _package_session("EMP_PKG"))
     result = recovering.run()
 
-    assert sha(remote) == stranded_sha  # the stranded commit finally reached the remote
+    # The stranded commit reached the remote. HEAD may have moved past it: the
+    # schema still held no watermark, so D-19 records one on top.
+    assert stranded_sha in git_log(remote)
     assert result.pushed is True
 
 

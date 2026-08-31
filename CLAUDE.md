@@ -78,7 +78,8 @@ for each database, sequentially:
     for each schema, sequentially:
         discover → extract → normalize → write → reconcile (scoped to this schema)
         stage this schema's files + deletions
-        nothing staged → no commit, no push, watermark untouched, next schema
+        nothing staged → no commit; a schema with NO watermark still records its
+                         first one in a state-only commit (D-19), otherwise silent
         commit → push (rebase + retry) → write this schema's state → amend → push
         any failure here → STOP; watermark not advanced; no later schema attempted
 emit summary → exit code
@@ -132,6 +133,7 @@ the inventory query failed, and never active in dry-run mode.
 | D-16 | Concurrency | **Sequential throughout** — the cross-database thread pool is removed |
 | D-17 | Failure semantics | **Stop the execution at the first schema-level failure.** Object-level failures stay contained. Departs from `requirements.md` §23 |
 | D-18 | v1 → v2 state migration | **Discard v1 watermarks** — one full export per schema |
+| D-19 | First watermark for an in-sync schema | **Recorded in a state-only commit**, once per schema. Without it an already-synchronized schema never becomes incremental |
 
 ---
 

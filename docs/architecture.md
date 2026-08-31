@@ -309,6 +309,17 @@ Three properties follow from this shape, and each solves a defect in the v1 mode
    mass-deletion threshold a percentage of that schema's files rather than the whole
    database's (decision D-6, amended).
 
+**A schema records its first watermark even when nothing changed** (decision D-19). State
+is otherwise written only when a commit happens, and that rule alone leaves a schema which
+is *already* in sync permanently un-watermarked: it exports in full, produces no diff,
+records nothing, and does the same again on the next run forever. That is not hypothetical
+— it is exactly the state D-18's migration puts every schema into, and the first
+post-migration run reproduced it: two schemas, 6,700 objects, five minutes, no commit, no
+state. So a schema holding **no** watermark records one on its first successful
+completion, in a commit carrying only the state file. A schema that already has one keeps
+the existing rule and stays silent. The churn is therefore bounded at one commit per
+schema, ever.
+
 **Migration from v1.** A v1 file records one watermark per database and *does not record
 which schemas were in scope when it was written*. Nothing in the file can prove the
 watermark applies to any particular schema, so the migration **discards v1 watermarks**
@@ -723,6 +734,11 @@ source changes. The sequence runs **once per schema** (decision D-3, amended by 
 `--force-with-lease` (never a bare `--force`) refuses to overwrite anything that arrived
 after our fetch, and is given an explicit expected SHA — the commit we ourselves just
 pushed — rather than relying on a remote-tracking ref that pushing by URL never updates.
+
+One case commits without any DDL change: a schema recording its first watermark (D-19).
+Its subject is ``<database>.<schema>||<ts>: Recorded initial watermark``, so it is never
+mistaken for a DDL change in the log, and its ``commit_sha`` in state is ``null`` because
+no DDL landed in it.
 
 An execution therefore produces **one commit per changed schema**, not one per run. Only
 schemas that actually changed produce a commit; a schema whose re-extracted content is
@@ -1277,6 +1293,8 @@ on 2026-08-31 and amend D-3 and D-6 where noted.
 | D-16 | Concurrency | **Sequential throughout** — the cross-database thread pool is removed (§1.3). Per-schema commits and a shared Git index cannot coexist with concurrent extraction without either buffering everything until the end (forfeiting durable partial progress) or corrupting the index. Recoverable later by extracting into per-schema buffers and committing sequentially, if extraction time ever becomes the constraint. |
 | D-17 | Failure semantics | **Stop the execution at the first schema-level failure.** No later schema or database is attempted; the failing schema's watermark is not advanced. Object-level failures stay contained as before. This knowingly departs from `docs/requirements.md` §23 ("a failure in one database must not stop the others") and is safe only because D-15 makes completed work durable before the failure. |
 | D-18 | v1 → v2 state migration | **Discard v1 watermarks.** A v1 file does not record which schemas were in scope when its watermark was written, so no attribution can be proven. Every schema takes one full export. Attributing it to the currently-configured schemas would silently skip changes for any schema added since — the same class of undetectable data loss the timezone defect produced. |
+
+| D-19 | First watermark for an in-sync schema | **Recorded, in a state-only commit.** A schema with no watermark records one on its first successful completion even when nothing changed; a schema that already has one stays silent. Without this an already-synchronized schema never becomes incremental — it re-exports in full on every run forever. Bounded at one commit per schema, ever. Amends `docs/requirements.md` §22 and `SPEC.MD` ("never updated for metadata-only executions"). |
 
 Commit subjects gain a schema component as a consequence of D-17 — see §11.5. That
 amends the format `docs/requirements.md` §9 specifies.

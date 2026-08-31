@@ -218,6 +218,7 @@ Each was flagged when introduced. Nothing here has been changed in
 | D-16 | Sequential throughout; thread pool removed | `workflow/pipeline.py` | `test_pipeline.py::test_every_schema_of_every_database_produces_a_run_unit` |
 | D-17 | Stop at the first schema-level failure | `workflow/pipeline.py::run` | `test_pipeline.py::test_a_database_failure_stops_the_execution` |
 | D-18 | v1 → v2 migration discards watermarks | `state/models.py::ExecutionState.from_dict` | `test_state.py::test_v1_watermarks_are_discarded`, `test_migrated_state_is_written_back_at_the_new_version` |
+| D-19 | First watermark recorded for an in-sync schema | `workflow/git_phase.py::_record_initial_watermark` | `test_pipeline.py::test_an_in_sync_schema_records_its_first_watermark`, `test_the_watermark_commit_carries_only_the_state_file`, `test_a_schema_that_already_has_a_watermark_stays_silent` |
 
 **One requirement is now deliberately unmet.** `docs/requirements.md` §23 says "a failure
 in one database must not stop the remaining databases". D-17 reverses that: the execution
@@ -232,6 +233,7 @@ Two further consequences worth tracking:
 | Consequence | Detail |
 |---|---|
 | Commit subjects changed | `<database>.<schema>||<ts>` amends the format `requirements.md` §9 specifies (§11.5) |
+| State written without a file change | D-19 records a first watermark in a state-only commit, amending `requirements.md` §22 and `SPEC.MD` ("never updated for metadata-only executions"). Bounded at one commit per schema, ever |
 | Module size limit raised | CLAUDE.md §7.3 moved from ~300 to ~400 lines. `src/oracle/sql.py` is additionally exempt from any split at any size, because the blocking read-only guard scans that one file |
 
 ---
