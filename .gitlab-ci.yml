@@ -29,6 +29,13 @@ include:
 
 .python:
   image: $PYTHON_IMAGE
+  # Tagged explicitly: this project's runner is registered with tags and so
+  # does not accept untagged jobs. Without this the whole validate stage sits
+  # pending and the pipeline is reported as "stuck" rather than failed.
+  # Only `ci_versioner` — tags are ANDed, and these jobs need no more than a
+  # Python image; `ssh` is required by `sync` alone.
+  tags:
+    - ci_versioner
   before_script:
     - pip install -r requirements-dev.txt
   rules:
@@ -68,6 +75,10 @@ type-check:
 
 secret_detection:
   stage: validate
+  # Same reason as `.python` above — this job comes from the included
+  # template, which carries no tags of its own.
+  tags:
+    - ci_versioner
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_PIPELINE_SOURCE == "push"
@@ -82,6 +93,12 @@ build-image:
   image: docker:27
   services:
     - docker:27-dind
+  # Tagged for the same reason as the validate jobs. Note this job needs a
+  # runner in privileged mode for docker-in-docker; if the registered runner
+  # is not privileged, this fails with a docker daemon connection error and
+  # the image has to be built and pushed by hand instead.
+  tags:
+    - ci_versioner
   rules:
     - if: $CI_PIPELINE_SOURCE == "web"
       when: manual
