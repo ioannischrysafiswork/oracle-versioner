@@ -32,7 +32,7 @@ from dataclasses import replace
 import pytest
 
 from src.config.models import DatabaseConfig, Settings
-from src.models.database import DatabaseRuntime
+from src.models.database import SchemaRuntime
 from src.models.oracle_object import ObjectType
 from src.normalizer.ddl_normalizer import DdlNormalizer
 from src.oracle import sql
@@ -169,7 +169,10 @@ def test_discovery_query_is_valid_sql_against_a_real_dictionary(
     the columns exist and the binds are accepted.
     """
     discovery = ObjectDiscovery(session, database, settings)
-    runtime = DatabaseRuntime(name="ITDB", git_folder=None, watermark=None)  # type: ignore[arg-type]
+    owner = database.schemas.include[0] if database.schemas.include else "SYS"
+    runtime = SchemaRuntime(
+        name="ITDB", schema=owner, git_folder=None, watermark=None  # type: ignore[arg-type]
+    )
     objects = discovery.discover_changed(runtime)
     assert isinstance(objects, list)
 

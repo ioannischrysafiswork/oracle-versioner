@@ -29,7 +29,7 @@ offline — no Oracle, no network, no GitLab.
 | Any number of databases | `config/loader.py` | `test_config.py::test_valid_database_parses` | ✅ |
 | Name, DSN, user, password, git folder | `config/models.py::DatabaseConfig` | `test_config.py` (38 tests) | ✅ |
 | Password never hardcoded | `config/secrets.py` | `test_config.py::test_secret_values_never_enter_the_configuration` | ✅ |
-| Connection failure does not stop other databases | `workflow/run_unit.py::run` | `test_pipeline.py::test_one_failed_database_does_not_stop_the_others` | ✅ |
+| Connection failure does not stop other databases | — | `test_pipeline.py::test_a_database_failure_stops_the_execution` | ⚠️ **Deliberately not met** — reversed by D-17; see below |
 | Connection pooling | `oracle/connection.py::ConnectionFactory` | — (needs a live instance) | ⚠️ |
 
 ## §4 Load metadata
@@ -178,14 +178,14 @@ offline — no Oracle, no network, no GitLab.
 | §22.3b `LAST_DDL_TIME` moved, source did not | `test_pipeline.py::test_unchanged_second_run_creates_no_commit` |
 | §22.4 Object dropped | `test_pipeline.py::test_dropped_object_file_is_reported_for_deletion` |
 | §22.5 Extraction fails | `test_pipeline.py::test_unmappable_name_fails_only_its_own_object` |
-| §22.6 Oracle unavailable | `test_pipeline.py::test_one_failed_database_does_not_stop_the_others` |
+| §22.6 Oracle unavailable | `test_pipeline.py::test_a_database_failure_stops_the_execution` |
 | §22.7 Push fails | `test_pipeline.py::test_state_is_not_advanced_when_the_push_fails` |
 
 ## Approved decisions
 
 | ID | Decision | Where | Test |
 |---|---|---|---|
-| D-1 | Reconciliation every execution | `workflow/run_unit.py::_reconcile` | `test_pipeline.py::test_dropped_object_file_is_reported_for_deletion` |
+| D-1 | Reconciliation every execution | `workflow/run_unit.py::_reconcile` (per schema) | `test_pipeline.py::test_dropped_object_file_is_reported_for_deletion` |
 | D-2 | `ALTER SESSION` permitted | `oracle/sql.py::SESSION_INITIALIZATION` | `test_connection.py::test_session_initialization_is_read_only` |
 | D-3 | Amend + `--force-with-lease` | `workflow/git_phase.py` | `test_git.py::test_the_lease_refuses_to_clobber_a_concurrent_push` |
 | D-4 | `git` CLI via subprocess | `git/git_client.py` | `test_git.py` (37 tests, real repositories) |
@@ -209,6 +209,32 @@ Each was flagged when introduced. Nothing here has been changed in
 | **D-12** | `ensure_branch` does not fast-forward to the remote tip | §11.2 places the fast-forward before staging, but extraction has already written files by then; a fast-forward could conflict with them. Divergence is handled by the rebase-and-retry path §11.6 defines | Yes |
 | **D-13** | Reconciliation blocked by the threshold does not fail the run | §14.3 says extraction results still commit, so the exit code stays 0 despite an `ERROR` | Yes — make it exit 1 |
 | **D-14** | `ruff` + `mypy` added as dev dependencies | §6 makes lint and type check blocking in CI; no toolchain is named. Dev-only, never in the runtime image | Yes, at the cost of dropping the gate |
+
+## Per-schema processing (D-15 … D-18, approved 2026-08-31)
+
+| Decision | Where | Test |
+|---|---|---|
+| D-15 | Unit of work and state are the schema | `state/models.py::SchemaState`, `workflow/run_unit.py` | `test_state.py::test_a_new_schema_of_a_known_database_has_no_watermark`, `test_advancing_one_schema_leaves_its_siblings_alone` |
+| D-16 | Sequential throughout; thread pool removed | `workflow/pipeline.py` | `test_pipeline.py::test_every_schema_of_every_database_produces_a_run_unit` |
+| D-17 | Stop at the first schema-level failure | `workflow/pipeline.py::run` | `test_pipeline.py::test_a_database_failure_stops_the_execution` |
+| D-18 | v1 → v2 migration discards watermarks | `state/models.py::ExecutionState.from_dict` | `test_state.py::test_v1_watermarks_are_discarded`, `test_migrated_state_is_written_back_at_the_new_version` |
+
+**One requirement is now deliberately unmet.** `docs/requirements.md` §23 says "a failure
+in one database must not stop the remaining databases". D-17 reverses that: the execution
+stops at the first schema-level failure. This is safe only because D-15 writes each
+schema's state between its own push and the next schema's work, so everything completed
+before the failure is already pushed and recorded and the next run resumes at the schema
+that failed. Under the previous per-run state model the same rule would have discarded the
+whole run's progress. Recorded here rather than edited into `requirements.md`, per §8.3.
+
+Two further consequences worth tracking:
+
+| Consequence | Detail |
+|---|---|
+| Commit subjects changed | `<database>.<schema>||<ts>` amends the format `requirements.md` §9 specifies (§11.5) |
+| Module size limit raised | CLAUDE.md §7.3 moved from ~300 to ~400 lines. `src/oracle/sql.py` is additionally exempt from any split at any size, because the blocking read-only guard scans that one file |
+
+---
 
 ## Known gaps
 

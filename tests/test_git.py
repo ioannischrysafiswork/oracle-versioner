@@ -22,7 +22,7 @@ from src.exceptions import GitError, PushError
 from src.git.commit import SKIP_CI_MARKER, CommitBuilder
 from src.git.git_client import GitClient, redact_url
 from src.git.push import Pusher, is_retryable_push_failure
-from src.models.execution import ExecutionResult, RunUnitResult
+from src.models.execution import RunUnitResult
 from src.repository.file_mapper import FileMapper
 from src.utils.timers import utc_now
 
@@ -183,11 +183,9 @@ def test_changed_content_does_stage(client: GitClient, repo: Path) -> None:
 # --------------------------------------------------------------------------- message
 
 
-def _result(databases: tuple[str, ...] = ("HRDB",)) -> ExecutionResult:
+def _unit(database: str = "HRDB", schema: str = "HR") -> RunUnitResult:
     now = utc_now()
-    result = ExecutionResult(execution_id="test", started_at=now, finished_at=now)
-    result.run_units = [RunUnitResult(database=name) for name in databases]
-    return result
+    return RunUnitResult(database=database, schema=schema, started_at=now, finished_at=now)
 
 
 def _mappers(repo: Path, *databases: str) -> dict[str, FileMapper]:
@@ -202,10 +200,10 @@ def test_commit_message_format(client: GitClient, repo: Path) -> None:
     client.add([added])
 
     builder = CommitBuilder(client, _mappers(repo, "HRDB"))
-    message = builder.build_message(_result(), previous_sha="abc123")
+    message = builder.build_message(_unit(), previous_sha="abc123")
     lines = message.splitlines()
 
-    assert lines[0].startswith("HRDB||")
+    assert lines[0].startswith("HRDB.HR||")
     assert lines[0].endswith(f": Updated Oracle objects {SKIP_CI_MARKER}")
     assert "Number of objects  : 1" in message
     assert "Previous commit    : abc123" in message
@@ -220,7 +218,7 @@ def test_commit_message_reports_gits_verdict(client: GitClient, repo: Path) -> N
     path.write_text("two\n", encoding="utf-8")
     client.add([path])
 
-    message = CommitBuilder(client, _mappers(repo, "HRDB")).build_message(_result(), "")
+    message = CommitBuilder(client, _mappers(repo, "HRDB")).build_message(_unit(), "")
     assert "HR.V (VIEW) [MODIFIED]" in message
 
 
@@ -232,28 +230,33 @@ def test_commit_message_is_deterministic_for_a_change_set(
         client.add([_write(repo, f"repository/HRDB/HR/packages/{name}.sql")])
 
     builder = CommitBuilder(client, _mappers(repo, "HRDB"))
-    body = builder.build_message(_result(), "x").split("Objects:")[1]
-    assert body == builder.build_message(_result(), "x").split("Objects:")[1]
+    body = builder.build_message(_unit(), "x").split("Objects:")[1]
+    assert body == builder.build_message(_unit(), "x").split("Objects:")[1]
     assert body.index("A_PKG") < body.index("B_PKG") < body.index("C_PKG")
 
 
-def test_multiple_databases_are_grouped(client: GitClient, repo: Path) -> None:
-    """The subject carries the list and the body groups per database (§11.5)."""
+def test_subject_names_the_one_schema_the_commit_is_for(
+    client: GitClient, repo: Path
+) -> None:
+    """One commit belongs to one schema, so the subject names it (§11.5).
+
+    Grouping by database is gone with it: a run touching four schemas now
+    produces four commits, and without the schema in the subject their subjects
+    would differ only by timestamp.
+    """
     client.add([_write(repo, "repository/HRDB/HR/packages/A.sql")])
-    client.add([_write(repo, "repository/SALESDB/SALES/views/B.sql")])
 
-    builder = CommitBuilder(client, _mappers(repo, "HRDB", "SALESDB"))
-    message = builder.build_message(_result(("HRDB", "SALESDB")), "x")
+    builder = CommitBuilder(client, _mappers(repo, "HRDB"))
+    message = builder.build_message(_unit("HRDB", "PAYROLL"), "x")
 
-    assert message.startswith("HRDB,SALESDB||")
-    assert "  HRDB:" in message
-    assert "  SALESDB:" in message
+    assert message.startswith("HRDB.PAYROLL||")
+    assert "  HRDB:" not in message
 
 
 def test_state_file_is_not_described_as_an_object(client: GitClient, repo: Path) -> None:
     """A path that maps to no Oracle object is omitted, never guessed at."""
     client.add([_write(repo, "state/execution_state.json", "{}\n")])
-    message = CommitBuilder(client, _mappers(repo, "HRDB")).build_message(_result(), "")
+    message = CommitBuilder(client, _mappers(repo, "HRDB")).build_message(_unit(), "")
     assert "execution_state" not in message
     assert "Number of objects  : 0" in message
 

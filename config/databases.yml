@@ -25,7 +25,9 @@ databases:
     username_env: CLIENTDB_USER
     password_env: CLIENTDB_PASSWORD
     schemas:
-      include: [ APP_SCHEMA_1 ]                # <-- TODO: put a schema name here before running
+      # Each schema keeps its own watermark, so adding one here gives it a full
+      # export on the next run without disturbing the others (decision D-15).
+      include: [ APP_SCHEMA_1, APP_SCHEMA_2 ]
 
 # - name: HRDB
 #   git_folder: HRDB              # subfolder under repository/

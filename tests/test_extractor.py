@@ -15,7 +15,7 @@ import pytest
 
 from src.config.models import DatabaseConfig, ObjectTypeFilter, SchemaFilter, Settings
 from src.exceptions import DiscoveryError, ExtractionError
-from src.models.database import DatabaseRuntime
+from src.models.database import SchemaRuntime
 from src.models.oracle_object import ExtractedSource, ObjectType, OracleObject
 from src.oracle import sql
 from src.oracle.ddl_extractor import MetadataStrategy
@@ -33,9 +33,11 @@ DB = DatabaseConfig(
     name="TESTDB", git_folder="TESTDB",
     dsn_env="D", username_env="U", password_env="P",
 )
-RUNTIME_FULL = DatabaseRuntime(name="TESTDB", git_folder=Path("TESTDB"), watermark=None)
-RUNTIME_INCREMENTAL = DatabaseRuntime(
-    name="TESTDB", git_folder=Path("TESTDB"),
+RUNTIME_FULL = SchemaRuntime(
+    name="TESTDB", schema="HR", git_folder=Path("TESTDB"), watermark=None
+)
+RUNTIME_INCREMENTAL = SchemaRuntime(
+    name="TESTDB", schema="HR", git_folder=Path("TESTDB"),
     watermark=datetime(2026, 8, 1, 9, 0, tzinfo=UTC),
 )
 

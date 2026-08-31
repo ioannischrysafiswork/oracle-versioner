@@ -21,7 +21,11 @@ from pathlib import Path
 
 from src.exceptions import StateError
 from src.logging.logger import get_logger
-from src.state.models import ExecutionState
+from src.state.models import (
+    LEGACY_STATE_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION,
+    ExecutionState,
+)
 from src.utils.filesystem import atomic_write_text
 
 __all__ = ["ExecutionStateStore"]
@@ -53,7 +57,7 @@ class ExecutionStateStore:
                 validated. Never recovered from by recreating the file.
         """
         if not self.path.exists():
-            _log.info("no state file at %s; every database performs a full export", self.path)
+            _log.info("no state file at %s; every schema performs a full export", self.path)
             return ExecutionState()
 
         try:
@@ -66,8 +70,30 @@ class ExecutionStateStore:
         except json.JSONDecodeError as exc:
             raise StateError(f"state file {self.path} is not valid JSON: {exc}") from exc
 
+        if isinstance(payload, dict) and payload.get("schema_version") == (
+            LEGACY_STATE_SCHEMA_VERSION
+        ):
+            # Announced loudly rather than silently: this run re-exports every
+            # schema in full, which is the intended effect of D-18 but looks
+            # alarming in the log if it is not explained.
+            _log.warning(
+                "state file %s is schema_version %d; its per-database watermarks cannot be "
+                "attributed to any schema and are discarded. Every schema performs one full "
+                "export, after which state is written at schema_version %d "
+                "(docs/architecture.md §4.4, decision D-18).",
+                self.path,
+                LEGACY_STATE_SCHEMA_VERSION,
+                STATE_SCHEMA_VERSION,
+            )
+
         state = ExecutionState.from_dict(payload)
-        _log.info("loaded state for %d database(s) from %s", len(state.databases), self.path)
+        schemas = sum(len(db.schemas) for db in state.databases.values())
+        _log.info(
+            "loaded state for %d schema(s) across %d database(s) from %s",
+            schemas,
+            len(state.databases),
+            self.path,
+        )
         return state
 
     def save(self, state: ExecutionState) -> None:
@@ -88,4 +114,10 @@ class ExecutionStateStore:
             raise StateError(f"cannot write state file {self.path}: {exc}") from exc
 
         self.saved = True
-        _log.info("wrote state for %d database(s) to %s", len(state.databases), self.path)
+        schemas = sum(len(db.schemas) for db in state.databases.values())
+        _log.info(
+            "wrote state for %d schema(s) across %d database(s) to %s",
+            schemas,
+            len(state.databases),
+            self.path,
+        )

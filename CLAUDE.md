@@ -67,17 +67,25 @@ instance and no network.
 
 One execution = one process = one synchronization = exit.
 
+The unit of work is one **schema**, carried all the way to a pushed commit before the
+next schema begins (decisions D-15…D-18).
+
 ```
 load config (fatal on invalid)
-load execution_state.json (fatal on parse error)
-EXTRACTION PHASE — concurrent across databases, sequential within a database
-    connect → discover → extract → normalize → write
-GIT PHASE — serialized, once per execution
-    stage written files + reconciliation deletions + state
-    nothing staged → exit 0, no commit, no state update
-    commit → push (rebase + retry) → update state → amend → push
+load execution_state.json (fatal on parse error, migrate v1 → v2)
+for each database, sequentially:
+    connect → resolve schema list
+    for each schema, sequentially:
+        discover → extract → normalize → write → reconcile (scoped to this schema)
+        stage this schema's files + deletions
+        nothing staged → no commit, no push, watermark untouched, next schema
+        commit → push (rebase + retry) → write this schema's state → amend → push
+        any failure here → STOP; watermark not advanced; no later schema attempted
 emit summary → exit code
 ```
+
+Schemas that completed before a failure keep their advanced watermarks — that is what
+makes stopping safe.
 
 ### 2.3 The two-gate design
 
@@ -95,9 +103,10 @@ diff. Git is the precise gate.
 
 | Scope | Model | Reason |
 |---|---|---|
-| Across databases | Thread pool | Extraction is I/O-bound |
-| Within a database | Sequential | Required; keeps session state predictable |
-| Git operations | Single-threaded, after all extraction | The index is one shared mutable resource |
+| Across databases | Sequential | Was a thread pool; removed by D-16 |
+| Across schemas | Sequential | Each commits and pushes before the next starts |
+| Within a schema | Sequential | Required; keeps session state predictable |
+| Git operations | Single-threaded, once per schema | The index is one shared mutable resource |
 
 ### 2.5 Deleted-object detection
 
@@ -106,8 +115,8 @@ handled by **inventory reconciliation**: query the full in-scope object list (me
 only, no source extraction), map to expected paths, and `git rm` any `.sql` file with no
 matching object. `src/repository/comparer.py` compares **path sets, not file contents**.
 
-Guarded by a mass-deletion threshold (default 10%), skipped when the inventory query
-failed, and never active in dry-run mode.
+Guarded by a mass-deletion threshold (default 10% **of the schema's files**), skipped when
+the inventory query failed, and never active in dry-run mode.
 
 ### 2.6 Approved decisions (from `docs/architecture.md` §23)
 
@@ -115,10 +124,14 @@ failed, and never active in dry-run mode.
 |---|---|---|
 | D-1 | Reconciliation frequency | Runs on **every execution** |
 | D-2 | `ALTER SESSION` for NLS and `DBMS_METADATA` transform parameters | **Permitted** — session-scoped, changes nothing in the database |
-| D-3 | State commit strategy | **Amend + `--force-with-lease`** (one commit per run) |
+| D-3 | State commit strategy | **Amend + `--force-with-lease`** (one commit per **schema**, amended by D-17) |
 | D-4 | Git access | **`git` CLI via `subprocess`**, no Git library dependency |
 | D-5 | Illegal/unsafe object names | **Fail the object loudly** — never silently encode |
-| D-6 | Mass-deletion safety threshold | **10%** of a database's files |
+| D-6 | Mass-deletion safety threshold | **10%** of a **schema's** files (amended by D-15) |
+| D-15 | Unit of work and state granularity | **The schema.** State v2 keyed by database + schema; each watermark advances only on its own successful push |
+| D-16 | Concurrency | **Sequential throughout** — the cross-database thread pool is removed |
+| D-17 | Failure semantics | **Stop the execution at the first schema-level failure.** Object-level failures stay contained. Departs from `requirements.md` §23 |
+| D-18 | v1 → v2 state migration | **Discard v1 watermarks** — one full export per schema |
 
 ---
 
@@ -302,7 +315,10 @@ Each phase ends by reporting what was built and waiting for the owner.
   `ORDER BY LINE` for `DBA_SOURCE`).
 - Project exception hierarchy; no bare `except:`; no silent swallowing.
 - No `print()` — use the configured logger.
-- No module beyond ~300 lines; no duplicated logic; readability over cleverness.
+- No module beyond ~400 lines; no duplicated logic; readability over cleverness.
+  **`src/oracle/sql.py` is exempt from any split regardless of size**: the blocking
+  read-only guard works by scanning that one file for every statement in the project,
+  so splitting it would quietly weaken the guarantee it exists to enforce (§3.4).
 - Every public function documented: purpose, args, returns, raises.
 
 ### 7.4 Definition of done

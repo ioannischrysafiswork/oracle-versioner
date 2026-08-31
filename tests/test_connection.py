@@ -131,6 +131,53 @@ def test_discovery_query_binds_every_configuration_value() -> None:
     assert_read_only(statement)
 
 
+def test_schema_list_query_binds_every_configuration_value() -> None:
+    """The schema-list query binds its values and mutates nothing."""
+    statement, binds = sql.build_schema_list_query(
+        object_types=("PACKAGE", "VIEW"),
+        include_schemas=("HR",),
+        exclude_schemas=("SCRATCH",),
+        oracle_maintained_column=True,
+    )
+    for value in ("PACKAGE", "VIEW", "HR", "SCRATCH"):
+        assert value not in statement
+    assert set(binds.values()) >= {"PACKAGE", "VIEW", "HR", "SCRATCH"}
+    assert_read_only(statement)
+
+
+def test_schema_list_query_is_never_incremental() -> None:
+    """No watermark predicate: a quiet schema must not drop out of scope.
+
+    If the schema list were incremental, a schema with no recent DDL would be
+    absent from it, never processed, and — because reconciliation is scoped to
+    the schemas being processed — its files would be left to rot or, worse,
+    treated as out of scope entirely.
+    """
+    statement, binds = sql.build_schema_list_query(
+        object_types=("PACKAGE",), oracle_maintained_column=True
+    )
+    assert "last_ddl_time" not in statement.lower()
+    assert "watermark" not in binds
+
+
+def test_schema_list_and_discovery_agree_on_scope() -> None:
+    """Both queries share one definition of "in scope"."""
+    kwargs = {
+        "object_types": ("PACKAGE", "VIEW"),
+        "include_schemas": ("HR",),
+        "exclude_schemas": ("SCRATCH",),
+        "oracle_maintained_column": True,
+    }
+    listed, list_binds = sql.build_schema_list_query(**kwargs)
+    discovered, discovery_binds = sql.build_discovery_query(incremental=False, **kwargs)
+    assert list_binds == discovery_binds
+
+    def predicates(statement: str) -> str:
+        return statement.split(" WHERE ", 1)[1].split(" ORDER BY ", 1)[0]
+
+    assert predicates(listed) == predicates(discovered)
+
+
 # --------------------------------------------------------------------------- classification
 
 

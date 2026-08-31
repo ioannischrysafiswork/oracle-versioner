@@ -60,8 +60,12 @@ Any number of Oracle databases can be configured. Each has:
 - Password (from environment variable / secret store — never hardcoded)
 - Git folder
 
-Connection failures do not stop processing of other databases. Each database execution
-is independent and maintains its own execution state.
+Each **schema** is processed in turn and carried all the way to its own pushed commit
+before the next begins, and each keeps its own watermark in `execution_state.json`. A
+failure stops the execution there: every schema already pushed keeps its advanced
+watermark, and the next run resumes at the one that failed. Adding a schema to the
+include filter is therefore self-correcting — it has no watermark, so it receives a full
+export.
 
 ---
 

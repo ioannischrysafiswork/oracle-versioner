@@ -39,6 +39,7 @@ __all__ = [
     "TRANSFORM_PARAM_STATEMENTS",
     "assert_read_only",
     "build_discovery_query",
+    "build_schema_list_query",
     "preflight_statement",
 ]
 
@@ -220,6 +221,102 @@ def _placeholders(prefix: str, values: tuple[str, ...]) -> tuple[str, dict[str, 
     return ", ".join(f":{name}" for name in names), dict(zip(names, values, strict=True))
 
 
+def _scope_predicates(
+    *,
+    object_types: tuple[str, ...],
+    include_schemas: tuple[str, ...],
+    exclude_schemas: tuple[str, ...],
+    oracle_maintained_column: bool,
+) -> tuple[list[str], dict[str, Any]]:
+    """Assemble the predicates that define "in scope", shared by every query.
+
+    Discovery, the reconciliation inventory, and the schema list must agree
+    exactly on what is in scope: a schema the list query omits is never
+    processed, and one the inventory omits has its files deleted. Deriving all
+    three from this one helper is what keeps them from drifting apart.
+
+    Args:
+        object_types: ``DBA_OBJECTS.OBJECT_TYPE`` values in scope.
+        include_schemas: Owners to restrict to; empty means "all not excluded".
+        exclude_schemas: Owners to exclude, on top of :data:`INTERNAL_SCHEMAS`.
+        oracle_maintained_column: Whether the server has the 12c+
+            ``ORACLE_MAINTAINED`` column.
+
+    Returns:
+        The predicate fragments and their bind mapping.
+
+    Raises:
+        ValueError: If ``object_types`` is empty, which would match nothing and
+            almost certainly indicates a configuration bug.
+    """
+    if not object_types:
+        raise ValueError("at least one object type must be in scope")
+
+    binds: dict[str, Any] = {}
+    predicates = list(_STATIC_PREDICATES)
+
+    types_text, type_binds = _placeholders("t", object_types)
+    predicates.insert(0, f"object_type IN ({types_text})")
+    binds.update(type_binds)
+
+    excluded = tuple(dict.fromkeys(INTERNAL_SCHEMAS + exclude_schemas))
+    exclude_text, exclude_binds = _placeholders("x", excluded)
+    predicates.append(f"owner NOT IN ({exclude_text})")
+    binds.update(exclude_binds)
+
+    if oracle_maintained_column:
+        predicates.append("oracle_maintained = 'N'")
+
+    if include_schemas:
+        include_text, include_binds = _placeholders("i", include_schemas)
+        predicates.append(f"owner IN ({include_text})")
+        binds.update(include_binds)
+
+    return predicates, binds
+
+
+def build_schema_list_query(
+    *,
+    object_types: tuple[str, ...],
+    include_schemas: tuple[str, ...] = (),
+    exclude_schemas: tuple[str, ...] = (),
+    oracle_maintained_column: bool,
+) -> tuple[str, dict[str, Any]]:
+    """Assemble the query that resolves which schemas are in scope.
+
+    Needed because the unit of work is the schema (decision D-15) and an empty
+    ``include`` filter means "every schema not excluded" — which cannot be
+    enumerated without asking the database. Never incremental: the schema list
+    must not depend on a watermark, or a schema with no recent DDL would
+    silently drop out of scope and have its files reconciled away.
+
+    Args:
+        object_types: ``DBA_OBJECTS.OBJECT_TYPE`` values in scope.
+        include_schemas: Owners to restrict to; empty means "all not excluded".
+        exclude_schemas: Owners to exclude, on top of :data:`INTERNAL_SCHEMAS`.
+        oracle_maintained_column: Whether the server has the 12c+
+            ``ORACLE_MAINTAINED`` column.
+
+    Returns:
+        The statement text and the bind mapping.
+
+    Raises:
+        ValueError: If ``object_types`` is empty.
+    """
+    predicates, binds = _scope_predicates(
+        object_types=object_types,
+        include_schemas=include_schemas,
+        exclude_schemas=exclude_schemas,
+        oracle_maintained_column=oracle_maintained_column,
+    )
+    statement = (
+        "SELECT DISTINCT owner FROM dba_objects WHERE "  # noqa: S608 - placeholders only
+        + " AND ".join(predicates)
+        + " ORDER BY owner"
+    )
+    return statement, binds
+
+
 def build_discovery_query(
     *,
     object_types: tuple[str, ...],
@@ -251,28 +348,12 @@ def build_discovery_query(
         ValueError: If ``object_types`` is empty, which would match nothing and
             almost certainly indicates a configuration bug.
     """
-    if not object_types:
-        raise ValueError("at least one object type must be in scope")
-
-    binds: dict[str, Any] = {}
-    predicates = list(_STATIC_PREDICATES)
-
-    types_text, type_binds = _placeholders("t", object_types)
-    predicates.insert(0, f"object_type IN ({types_text})")
-    binds.update(type_binds)
-
-    excluded = tuple(dict.fromkeys(INTERNAL_SCHEMAS + exclude_schemas))
-    exclude_text, exclude_binds = _placeholders("x", excluded)
-    predicates.append(f"owner NOT IN ({exclude_text})")
-    binds.update(exclude_binds)
-
-    if oracle_maintained_column:
-        predicates.append("oracle_maintained = 'N'")
-
-    if include_schemas:
-        include_text, include_binds = _placeholders("i", include_schemas)
-        predicates.append(f"owner IN ({include_text})")
-        binds.update(include_binds)
+    predicates, binds = _scope_predicates(
+        object_types=object_types,
+        include_schemas=include_schemas,
+        exclude_schemas=exclude_schemas,
+        oracle_maintained_column=oracle_maintained_column,
+    )
 
     if incremental:
         predicates.append("last_ddl_time > :watermark")

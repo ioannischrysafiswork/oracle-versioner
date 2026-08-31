@@ -1,8 +1,12 @@
 """Commit message construction and the empty-commit gate.
 
-Subject (docs/requirements.md §9)::
+Subject (docs/architecture.md §11.5, amending docs/requirements.md §9)::
 
-    <database>||<sysdate>: Updated Oracle objects
+    <database>.<schema>||<sysdate>: Updated Oracle objects
+
+The schema component follows from one commit per schema (decision D-17).
+Without it a run touching four schemas produces four commits whose subjects
+differ only by timestamp.
 
 Body::
 
@@ -14,9 +18,10 @@ Body::
     Objects:
       <OWNER>.<OBJECT_NAME> (<OBJECT_TYPE>) [ADDED|MODIFIED|DELETED]
 
-The object list is ordered by ``OWNER, OBJECT_TYPE, OBJECT_NAME`` and grouped
-per database, so two runs producing the same change set produce byte-identical
-bodies.
+The object list is ordered by ``OWNER, OBJECT_TYPE, OBJECT_NAME``, so two runs
+producing the same change set produce byte-identical bodies. Every object in
+one commit belongs to the one schema that commit is for, so no grouping is
+needed.
 
 The ADDED/MODIFIED/DELETED verdict is Git's, read from
 ``git diff --cached --name-status`` and mapped back to objects through the
@@ -35,7 +40,7 @@ from pathlib import Path
 
 from src.exceptions import RepositoryError
 from src.git.git_client import GitClient
-from src.models.execution import ExecutionResult
+from src.models.execution import RunUnitResult
 from src.repository.file_mapper import FileMapper
 from src.utils.timers import format_duration, to_utc
 
@@ -70,74 +75,73 @@ class CommitBuilder:
         """
         return bool(self.client.staged_changes())
 
-    def describe_staged(self) -> dict[str, list[str]]:
-        """Describe the staged set as object lines, grouped by database.
+    def describe_staged(self) -> list[str]:
+        """Describe the staged set as object lines.
 
         Paths that do not map to an Oracle object — the state file, most
         obviously — are omitted rather than guessed at.
 
         Returns:
-            Database name to sorted ``OWNER.NAME (TYPE) [VERDICT]`` lines.
+            Sorted ``OWNER.NAME (TYPE) [VERDICT]`` lines.
         """
-        grouped: dict[str, list[str]] = {}
+        lines: list[str] = []
         for status, path in self.client.staged_changes():
-            for database, mapper in self.mappers.items():
+            for mapper in self.mappers.values():
                 try:
                     obj = mapper.to_object(path)
                 except RepositoryError:
                     continue
                 verdict = _STATUS_WORDS.get(status, status)
-                grouped.setdefault(database, []).append(
+                lines.append(
                     f"  {obj.owner}.{obj.object_name} ({obj.object_type}) [{verdict}]"
                 )
                 break
 
-        for lines in grouped.values():
-            lines.sort()
-        return grouped
+        lines.sort()
+        return lines
 
-    def build_message(self, result: ExecutionResult, previous_sha: str) -> str:
-        """Render the full commit message for ``result``.
+    def build_message(self, unit: RunUnitResult, previous_sha: str) -> str:
+        """Render the full commit message for one schema.
+
+        Must be called while that schema's DDL changes are still in the index:
+        the amend that adds the state file re-uses this text rather than
+        rebuilding it, because rebuilding would describe an index holding
+        nothing but the state file and publish an empty object list.
 
         Args:
-            result: The completed execution.
+            unit: The completed run unit for the schema being committed.
             previous_sha: HEAD before this commit, for the body.
 
         Returns:
             Subject and body, deterministic for a given change set and carrying
             the ``[skip ci]`` marker.
         """
-        grouped = self.describe_staged()
-        databases = sorted(grouped) or sorted(unit.database for unit in result.run_units)
-        finished = to_utc(result.finished_at) if result.finished_at else None
-        started = to_utc(result.started_at) if result.started_at else None
-        stamp = (finished or started)
+        lines = self.describe_staged()
+        finished = to_utc(unit.finished_at) if unit.finished_at else None
+        started = to_utc(unit.started_at) if unit.started_at else None
+        stamp = finished or started
         timestamp = stamp.isoformat() if stamp else ""
 
-        subject = f"{','.join(databases)}||{timestamp}: Updated Oracle objects {SKIP_CI_MARKER}"
+        subject = (
+            f"{unit.database}.{unit.schema}||{timestamp}: "
+            f"Updated Oracle objects {SKIP_CI_MARKER}"
+        )
 
         duration = ""
         if started and finished:
             duration = format_duration((finished - started).total_seconds())
-        objects = sum(len(lines) for lines in grouped.values())
 
         body = [
             "",
             f"Execution time     : {started.isoformat() if started else '-'} -> "
             f"{finished.isoformat() if finished else '-'} ({duration})",
-            f"Number of objects  : {objects}",
+            f"Number of objects  : {len(lines)}",
             f"Previous commit    : {previous_sha or '-'}",
             f"New execution ts   : {timestamp}",
             "",
             "Objects:",
+            *lines,
         ]
-        for database in databases:
-            lines = grouped.get(database, [])
-            if len(databases) > 1:
-                body.append(f"  {database}:")
-                body.extend(f"  {line}" for line in lines)
-            else:
-                body.extend(lines)
 
         return subject + "\n" + "\n".join(body) + "\n"
 

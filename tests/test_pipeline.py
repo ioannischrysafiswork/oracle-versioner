@@ -14,10 +14,10 @@ from pathlib import Path
 import pytest
 
 from src.config.models import AppConfig, DatabaseConfig, RetrySettings, Settings
-from src.models.database import DatabaseRuntime
+from src.models.database import SchemaRuntime
 from src.models.execution import ExecutionStatus, ExitCode, RunUnitResult
 from src.state.execution_state import ExecutionStateStore
-from src.state.models import DatabaseState, ExecutionState
+from src.state.models import ExecutionState, SchemaState
 from src.workflow.pipeline import Pipeline
 from tests.conftest import FakeConnectionFactory, FakeSession
 
@@ -70,34 +70,38 @@ def _pipeline(
 
 def test_no_state_means_full_export(tmp_path: Path) -> None:
     """A database with no recorded run exports everything."""
-    runtime = _pipeline(tmp_path)._runtime_for(_db("HRDB"))
+    pipeline = _pipeline(tmp_path)
+    runtime = pipeline._runtime_for(_db("HRDB"), "HR", pipeline.state)
     assert runtime.watermark is None
     assert runtime.is_full_export is True
 
 
 def test_watermark_has_the_overlap_subtracted(tmp_path: Path) -> None:
     """The safety overlap guards against DATE truncation and clock skew."""
-    state = ExecutionState(
-        databases={"HRDB": DatabaseState("HRDB", last_successful_run=MOMENT)}
+    state = ExecutionState().with_schema(
+        "HRDB", SchemaState("HR", last_successful_run=MOMENT)
     )
-    runtime = _pipeline(tmp_path, state=state)._runtime_for(_db("HRDB"))
+    pipeline = _pipeline(tmp_path, state=state)
+    runtime = pipeline._runtime_for(_db("HRDB"), "HR", state)
     assert runtime.watermark == datetime(2026, 1, 1, 11, 55, tzinfo=UTC)
     assert runtime.is_full_export is False
 
 
 def test_overlap_is_configurable(tmp_path: Path) -> None:
     """A zero overlap uses the recorded watermark verbatim."""
-    state = ExecutionState(
-        databases={"HRDB": DatabaseState("HRDB", last_successful_run=MOMENT)}
+    state = ExecutionState().with_schema(
+        "HRDB", SchemaState("HR", last_successful_run=MOMENT)
     )
     settings = replace(Settings(), watermark_overlap_minutes=0)
-    runtime = _pipeline(tmp_path, state=state, settings=settings)._runtime_for(_db("HRDB"))
+    pipeline = _pipeline(tmp_path, state=state, settings=settings)
+    runtime = pipeline._runtime_for(_db("HRDB"), "HR", state)
     assert runtime.watermark == MOMENT
 
 
 def test_git_folder_is_rooted_under_the_repository(tmp_path: Path) -> None:
     """Each database writes only inside its own subtree."""
-    runtime = _pipeline(tmp_path)._runtime_for(_db("HRDB"))
+    pipeline = _pipeline(tmp_path)
+    runtime = pipeline._runtime_for(_db("HRDB"), "HR", pipeline.state)
     assert runtime.git_folder == tmp_path / "repository" / "HRDB"
 
 
@@ -111,18 +115,41 @@ def test_no_databases_is_a_successful_no_op(tmp_path: Path) -> None:
     assert result.exit_code is ExitCode.SUCCESS
 
 
-def test_every_configured_database_produces_a_run_unit(tmp_path: Path) -> None:
-    """Results come back in configuration order, not completion order."""
+def test_every_schema_of_every_database_produces_a_run_unit(tmp_path: Path) -> None:
+    """The unit of work is the schema, and order is configuration order."""
     databases = tuple(_db(name) for name in ("CDB", "ADB", "BDB"))
-    result = _pipeline(tmp_path, databases).run()
-    assert [unit.database for unit in result.run_units] == ["CDB", "ADB", "BDB"]
+    factory = FakeConnectionFactory(session=_schema_only_session("HR", "PAYROLL"))
+    result = _pipeline(tmp_path, databases, factory=factory).run()
+    assert [(u.database, u.schema) for u in result.run_units] == [
+        ("CDB", "HR"), ("CDB", "PAYROLL"),
+        ("ADB", "HR"), ("ADB", "PAYROLL"),
+        ("BDB", "HR"), ("BDB", "PAYROLL"),
+    ]
 
 
 def test_disabled_databases_are_skipped(tmp_path: Path) -> None:
     """Only enabled databases are processed."""
     databases = (_db("ON"), replace(_db("OFF"), enabled=False))
-    result = _pipeline(tmp_path, databases).run()
+    factory = FakeConnectionFactory(session=_schema_only_session("HR"))
+    result = _pipeline(tmp_path, databases, factory=factory).run()
     assert [unit.database for unit in result.run_units] == ["ON"]
+
+
+def test_a_configured_schema_the_database_does_not_report_is_skipped(
+    tmp_path: Path,
+) -> None:
+    """Safety property, not an optimization.
+
+    Were such a schema processed, its inventory would come back empty and
+    reconciliation would read that as "every object was dropped" and stage the
+    deletion of every file under it.
+    """
+    from src.config.models import SchemaFilter
+
+    database = replace(_db("HRDB"), schemas=SchemaFilter(include=("HR", "TYPO")))
+    factory = FakeConnectionFactory(session=_schema_only_session("HR"))
+    result = _pipeline(tmp_path, (database,), factory=factory).run()
+    assert [unit.schema for unit in result.run_units] == ["HR"]
 
 
 def test_state_is_never_written_during_a_run(tmp_path: Path) -> None:
@@ -147,17 +174,23 @@ def test_pools_are_closed_after_the_extraction_phase(tmp_path: Path) -> None:
     assert factory.closed is True
 
 
-def test_one_failed_database_does_not_stop_the_others(tmp_path: Path) -> None:
-    """A connection outage is contained to its own run unit (§22.6)."""
+def test_a_database_failure_stops_the_execution(tmp_path: Path) -> None:
+    """Decision D-17, reversing the old "other databases continue" rule.
+
+    Safe only because state is per schema and written between each schema's
+    push and the next schema's work: everything completed before the failure
+    is already pushed and recorded, so stopping loses nothing and the next run
+    resumes where this one stopped.
+    """
     from src.exceptions import ConnectionError as OracleConnectionError
 
     factory = FakeConnectionFactory(error=OracleConnectionError("no listener"))
     result = _pipeline(tmp_path, (_db("ADB"), _db("BDB")), factory=factory).run()
-    assert [unit.status for unit in result.run_units] == [
-        ExecutionStatus.FAILED, ExecutionStatus.FAILED
-    ]
+
+    assert result.run_units == []          # BDB was never attempted
     assert result.status is ExecutionStatus.FAILED
     assert result.exit_code is ExitCode.FAILURE
+    assert "no listener" in (result.stopped_by or "")
 
 
 def test_discovered_objects_are_counted(tmp_path: Path) -> None:
@@ -201,12 +234,14 @@ def test_normalization_failure_is_contained_to_its_object() -> None:
         ],
         "dba_source": [("PACKAGE p AS END;\n",)],
     })
-    runtime = DatabaseRuntime(name="HRDB", git_folder=Path("HRDB"), watermark=None)
+    runtime = SchemaRuntime(
+        name="HRDB", schema="HR", git_folder=Path("HRDB"), watermark=None
+    )
     result = RunUnit(
         _db("HRDB"),
         runtime,
         Settings(),
-        FakeConnectionFactory(session=session),
+        session,
         normalizer=ExplodingNormalizer(),
     ).run()
 
@@ -231,10 +266,12 @@ def test_normalized_source_reaches_the_normalizer() -> None:
         "dba_objects": [("HR", "PACKAGE", "P1", "VALID", None, None)],
         "dba_source": [("PACKAGE p1 AS END;\n",)],
     })
-    runtime = DatabaseRuntime(name="HRDB", git_folder=Path("HRDB"), watermark=None)
+    runtime = SchemaRuntime(
+        name="HRDB", schema="HR", git_folder=Path("HRDB"), watermark=None
+    )
     RunUnit(
         _db("HRDB"), runtime, Settings(),
-        FakeConnectionFactory(session=session), normalizer=RecordingNormalizer(),
+        session, normalizer=RecordingNormalizer(),
     ).run()
 
     assert len(seen) == 1
@@ -247,20 +284,31 @@ def _run_unit(tmp_path: Path, session: FakeSession, database=None, **settings_kw
     from src.workflow.run_unit import RunUnit
 
     database = database or _db("HRDB")
-    runtime = DatabaseRuntime(name="HRDB", git_folder=tmp_path / "HRDB", watermark=None)
+    runtime = SchemaRuntime(
+        name="HRDB", schema="HR", git_folder=tmp_path / "HRDB", watermark=None
+    )
     return RunUnit(
         database,
         runtime,
         replace(Settings(), **settings_kw) if settings_kw else Settings(),
-        FakeConnectionFactory(session=session),
+        session,
     )
 
 
-def _package_session(*names: str) -> FakeSession:
+def _package_session(*names: str, schemas: tuple[str, ...] = ("HR",)) -> FakeSession:
     return FakeSession({
+        # The schema-list query (SELECT DISTINCT owner) is what the pipeline
+        # uses to decide which schemas to process at all; without it a
+        # pipeline-level test runs nothing (decision D-15).
+        "DISTINCT owner": [(name,) for name in schemas],
         "dba_objects": [("HR", "PACKAGE", name, "VALID", None, None) for name in names],
         "dba_source": [("PACKAGE p AS\n",), ("END;\n",)],
     })
+
+
+def _schema_only_session(*schemas: str) -> FakeSession:
+    """A session that reports schemas but no objects in them."""
+    return FakeSession({"DISTINCT owner": [(name,) for name in schemas]})
 
 
 # --------------------------------------------------------------------------- writing
@@ -299,10 +347,12 @@ def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     from src.workflow.run_unit import RunUnit
 
     writer = NullWriter()
-    runtime = DatabaseRuntime(name="HRDB", git_folder=tmp_path / "HRDB", watermark=None)
+    runtime = SchemaRuntime(
+        name="HRDB", schema="HR", git_folder=tmp_path / "HRDB", watermark=None
+    )
     result = RunUnit(
         _db("HRDB"), runtime, Settings(),
-        FakeConnectionFactory(session=_package_session("P1")), writer=writer,
+        _package_session("P1"), writer=writer,
     ).run()
 
     assert result.objects_exported == 1
@@ -410,31 +460,43 @@ def test_reconciliation_ignores_out_of_scope_schemas(tmp_path: Path) -> None:
 
 
 def test_missing_grants_fail_the_database_by_name(tmp_path: Path) -> None:
-    """A missing grant is reported up front, not part-way through (§21.2)."""
+    """A missing grant is reported up front, not part-way through (§21.2).
+
+    Checked once per database, before its schema list is even resolved, so a
+    missing grant cannot be discovered halfway through the third schema.
+    """
     session = _package_session("P1")
     session.failures["dba_views"] = RuntimeError("ORA-00942: table or view does not exist")
+    factory = FakeConnectionFactory(session=session)
 
-    result = _run_unit(tmp_path, session).run()
+    result = _pipeline(tmp_path, (_db("HRDB"),), factory=factory).run()
 
     assert result.status is ExecutionStatus.FAILED
-    assert result.objects_discovered == 0  # nothing was even attempted
+    assert result.run_units == []                       # nothing was attempted
+    assert "dba_views" in (result.stopped_by or "")     # named, not guessed at
 
 
 def test_preflight_passes_when_every_view_is_readable(tmp_path: Path) -> None:
-    """The happy path is not blocked by the new check."""
-    assert _run_unit(tmp_path, _package_session("P1")).run().objects_exported == 1
+    """The happy path is not blocked by the check."""
+    factory = FakeConnectionFactory(session=_package_session("P1"))
+    result = _pipeline(tmp_path, (_db("HRDB"),), factory=factory).run()
+    assert result.run_units[0].objects_exported == 1
 
 
 def test_wall_clock_timeout_stops_the_run_unit(tmp_path: Path) -> None:
-    """A slow database must not consume the whole CI job timeout (§15)."""
+    """A slow database must not consume the whole CI job timeout (§15).
+
+    Raised now rather than reported as a status: under D-17 a schema-level
+    failure stops the execution, and the caller turns it into the summary.
+    """
     from src.config.models import RetrySettings
+    from src.exceptions import DatabaseError
 
     session = _package_session(*[f"P{i}" for i in range(5)])
     unit = _run_unit(tmp_path, session, retry=replace(RetrySettings(), run_unit_timeout_seconds=0))
-    result = unit.run()
 
-    assert result.status is ExecutionStatus.FAILED
-    assert result.objects_exported == 0  # the deadline was already spent
+    with pytest.raises(DatabaseError, match="wall-clock timeout"):
+        unit.run()
 
 
 def test_generous_timeout_does_not_interfere(tmp_path: Path) -> None:
@@ -450,7 +512,7 @@ def test_generous_timeout_does_not_interfere(tmp_path: Path) -> None:
 
 def test_candidate_watermark_comes_from_the_database_clock(tmp_path: Path) -> None:
     """Never the runner clock — skew would cause missed changes (§4.2)."""
-    factory = FakeConnectionFactory()
+    factory = FakeConnectionFactory(session=_schema_only_session("HR"))
     unit = _pipeline(tmp_path, (_db("HRDB"),), factory=factory).run().run_units[0]
     assert unit.candidate_watermark == datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
 
@@ -548,7 +610,7 @@ def test_full_git_phase_commits_pushes_then_advances_state(tmp_path: Path) -> No
 
     # State advanced to the database clock only after the push succeeded.
     assert pipeline.state_store.saved is True
-    assert pipeline.state.watermark_for("HRDB") == datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+    assert pipeline.state.watermark_for("HRDB", "HR") == datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
 
 
 def test_unchanged_second_run_creates_no_commit(tmp_path: Path) -> None:
@@ -583,67 +645,60 @@ def test_state_is_not_advanced_when_the_push_fails(tmp_path: Path) -> None:
     pipeline = _git_pipeline(repo, _package_session("EMP_PKG"))
     pipeline.git_client.run(["remote", "set-url", "origin", "https://127.0.0.1:1/nope.git"])
 
-    with pytest.raises(PushError):
-        pipeline.run()
+    result = pipeline.run()
 
+    assert result.status is ExecutionStatus.FAILED
+    assert result.pushed is False
     assert pipeline.state_store.saved is False
     assert not pipeline.state_store.path.exists()
+    assert issubclass(PushError, Exception)
 
 
 def test_a_commit_stranded_by_an_earlier_failed_push_is_recovered(tmp_path: Path) -> None:
     """Regression: found live against a real database.
 
-    A run committed locally and then failed to push (wrong remote configured).
-    The next run re-extracted identical content, so nothing new was staged —
-    and the old code concluded "nothing to do" without ever noticing HEAD was
-    still sitting unpushed. The commit would have been stranded forever, since
-    architecture §22.7's recovery story assumes the next run always produces a
-    fresh diff, which is false whenever content is unchanged.
+    A run committed locally and then failed to push. The next run re-extracted
+    identical content, so nothing new was staged — and the old code concluded
+    "nothing to do" without ever noticing HEAD was still sitting unpushed. The
+    commit would have been stranded forever, since architecture §22.7's
+    recovery story assumes the next run always produces a fresh diff, which is
+    false whenever the content is unchanged.
+
+    Checked once per execution rather than once per schema: a stranded commit
+    is a property of the repository, and the check costs a network round trip.
     """
     import subprocess
 
+    def sha(cwd: Path) -> str:
+        return subprocess.run(
+            ["git", "rev-parse", "refs/heads/main"], cwd=cwd,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
     repo, remote = _repo_with_remote(tmp_path)
 
-    # Simulate the first run's local commit succeeding but its push failing:
-    # commit for real, but never push, exactly like a PushError would leave
-    # things (git_phase resets the index on failure, but the commit itself
-    # already exists by the time push is attempted).
+    # First run writes the files but never touches git, then we commit them by
+    # hand and deliberately do not push — exactly the state a failed push
+    # leaves behind, since the commit already exists by the time push runs.
+    _git_pipeline(repo, _package_session("EMP_PKG"), no_git=True).run()
+    written = list((repo / "repository").rglob("*.sql"))
+    assert written, "the first run should have written the package"
+
     stranded = _git_pipeline(repo, _package_session("EMP_PKG"))
-    written = stranded._extraction_phase(stranded.config.enabled_databases)
-    from src.workflow.git_phase import GitPhase
-
-    phase = GitPhase(
-        stranded.config, stranded.state, stranded.state_store,
-        stranded._mappers(), stranded.git_client, stranded.secret_provider,
-    )
-    from src.models.execution import ExecutionResult
-
-    result = ExecutionResult(execution_id="stranded", run_units=written)
-    from src.git.commit import CommitBuilder
-
-    builder = CommitBuilder(stranded.git_client, phase.mappers)
-    written_paths = [p for u in written for p in u.written_paths]
-    CommitBuilder.stage(stranded.git_client, written_paths, [])
-    stranded.git_client.commit(builder.build_message(result, ""))
-    # Deliberately no push here — this is the stranded state.
-
+    stranded.git_client.configure_identity("Bot", "bot@example.invalid")
+    stranded.git_client.add(written)
+    stranded.git_client.commit("stranded\n")
     stranded_sha = stranded.git_client.rev_parse("HEAD")
-    remote_before = subprocess.run(
-        ["git", "rev-parse", "refs/heads/main"], cwd=remote,
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
+
+    remote_before = sha(remote)
     assert stranded_sha != remote_before  # confirms the stranding actually happened
 
     # The next run re-extracts identical content: nothing new to stage.
     recovering = _git_pipeline(repo, _package_session("EMP_PKG"))
-    recovering.run()
+    result = recovering.run()
 
-    remote_after = subprocess.run(
-        ["git", "rev-parse", "refs/heads/main"], cwd=remote,
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    assert remote_after != remote_before  # the remote moved
-    assert recovering.state_store.saved is True  # and state finally advanced
+    assert sha(remote) == stranded_sha  # the stranded commit finally reached the remote
+    assert result.pushed is True
 
 
 @pytest.mark.parametrize(
@@ -657,24 +712,54 @@ def test_a_commit_stranded_by_an_earlier_failed_push_is_recovered(tmp_path: Path
             ExecutionStatus.SUCCESS,
             ExitCode.SUCCESS,
         ),
-        ([ExecutionStatus.FAILED], ExecutionStatus.FAILED, ExitCode.FAILURE),
         (
-            [ExecutionStatus.FAILED, ExecutionStatus.SUCCESS],
-            ExecutionStatus.PARTIAL_FAILURE,
-            ExitCode.FAILURE,
+            [ExecutionStatus.NO_CHANGES, ExecutionStatus.NO_CHANGES],
+            ExecutionStatus.NO_CHANGES,
+            ExitCode.SUCCESS,
         ),
     ],
 )
 def test_status_aggregation(
     statuses: list[ExecutionStatus], expected: ExecutionStatus, exit_code: ExitCode
 ) -> None:
-    """One failed database is enough to make the pipeline visibly red."""
+    """Aggregation only ever sees schemas that completed.
+
+    There is no FAILED or PARTIAL_FAILURE case to aggregate any more: under
+    D-17 a schema-level failure stops the execution, and the status is set on
+    the way out rather than derived from the units.
+    """
     from src.models.execution import ExecutionResult
 
     result = ExecutionResult(execution_id="x")
     result.run_units = [
-        RunUnitResult(database=f"DB{i}", status=status) for i, status in enumerate(statuses)
+        RunUnitResult(database="HRDB", schema=f"S{i}", status=status)
+        for i, status in enumerate(statuses)
     ]
     result.status = Pipeline._aggregate(result)
     assert result.status is expected
     assert result.exit_code is exit_code
+
+
+def test_a_stopped_execution_is_failed_regardless_of_what_completed() -> None:
+    """Schemas that succeeded before the failure do not make the run green."""
+    from src.models.execution import ExecutionResult
+
+    result = ExecutionResult(execution_id="x")
+    result.run_units = [
+        RunUnitResult(database="HRDB", schema="HR", status=ExecutionStatus.SUCCESS, pushed=True)
+    ]
+    result.status = ExecutionStatus.FAILED
+    result.stopped_by = "no listener"
+
+    assert result.exit_code is ExitCode.FAILURE
+
+
+def test_a_stranded_commit_alone_makes_the_run_a_success() -> None:
+    """Pushing a previous run's commit is a real change, even if no schema moved."""
+    from src.models.execution import ExecutionResult
+
+    result = ExecutionResult(execution_id="x", pushed=True, commit_sha="abc")
+    result.run_units = [
+        RunUnitResult(database="HRDB", schema="HR", status=ExecutionStatus.NO_CHANGES)
+    ]
+    assert Pipeline._aggregate(result) is ExecutionStatus.SUCCESS

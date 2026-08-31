@@ -65,39 +65,62 @@ with no Oracle instance and no network.
 
 One execution = one process = one synchronization = exit.
 
+The unit of work is one **schema**, not one database. Each schema is carried all the
+way from extraction to a pushed commit before the next schema begins, and each advances
+its own watermark only on success (§4.4, decisions D-15…D-18).
+
 ```
 main
  └─ load configuration          (fatal on invalid)
- └─ load execution_state.json   (fatal on parse error)
- └─ EXTRACTION PHASE  ── concurrent across databases
- │    for each enabled database (independent run unit):
- │      1. connect (pool)
- │      2. discover changed objects       LAST_DDL_TIME > watermark
- │      3. extract source                 per-type strategy
- │      4. normalize                      deterministic
- │      5. write .sql files               unconditional overwrite
- │      → RunUnitResult(status, counts, object statuses, files written)
+ └─ load execution_state.json   (fatal on parse error, migrate v1 → v2)
+ └─ for each enabled database, sequentially:
+ │    connect (pool)
+ │    resolve the schema list   (config include, or SELECT DISTINCT OWNER)
  │
- └─ GIT PHASE  ── serialized, single-threaded, once per execution
- │      6. stage only files written in step 5 (+ deletions if reconciling)
- │      7. abort if nothing staged  → exit 0, no commit, no state update
- │      8. commit
- │      9. push (rebase + retry)
- │     10. update execution_state.json and amend into the commit, push
+ │    └─ for each schema, sequentially — one complete cycle each:
+ │         1. discover changed objects    LAST_DDL_TIME > this schema's watermark
+ │         2. extract source              per-type strategy
+ │         3. normalize                   deterministic
+ │         4. write .sql files            unconditional overwrite
+ │         5. reconcile deletions         scoped to this schema only
+ │         6. stage this schema's written files and deletions
+ │         7. nothing staged  → no commit, no push, watermark untouched, next schema
+ │         8. commit                      <database>.<schema>||<ts>: …
+ │         9. push (rebase + retry)
+ │        10. write this schema's state, amend into the commit, force-push with lease
+ │        ── any failure in 1-10 ⇒ STOP THE EXECUTION (§14.3). This schema's
+ │           watermark is not advanced, and no later schema is attempted.
+ │           Schemas already pushed keep their advanced watermarks.
  │
  └─ emit summary · exit code
 ```
+
+The consequence of step 10 preceding the next schema is that partial progress is durable:
+an execution that fails on the fourth schema leaves the first three correctly synchronized
+and recorded, and the next run resumes from the fourth.
 
 ### 1.3 Concurrency model
 
 | Scope | Model | Reason |
 |---|---|---|
-| Across databases | Thread pool, N workers (configurable, default = number of enabled databases, capped) | Requirement: process multiple databases concurrently. Extraction is I/O-bound, so threads are sufficient; no need for multiprocessing. |
-| Within a database | Sequential | Requirement: do not process multiple objects from the same database in parallel unless safe. Sequential also keeps `DBMS_METADATA` session transform state predictable. |
-| Git operations | Single-threaded critical section, after all extraction finishes | The working tree and the index are one shared mutable resource. Concurrent `git add`/`commit` would corrupt the index. |
+| Across databases | Sequential | Was a thread pool. Per-schema commits made it untenable — see below (decision D-16). |
+| Across schemas | Sequential | Each schema commits and pushes before the next starts, so they cannot overlap by construction. |
+| Within a schema | Sequential | Requirement: do not process multiple objects from the same database in parallel unless safe. Sequential also keeps `DBMS_METADATA` session transform state predictable. |
+| Git operations | Single-threaded, interleaved with extraction, once per schema | The working tree and the index are one shared mutable resource. |
 
-Each run unit writes only inside its own `repository/<DATABASE>/` subtree, so concurrent
-extraction threads never touch the same path.
+**Why the thread pool was removed.** It existed because extraction is I/O-bound and
+databases are independent. That reasoning still holds for *extraction* — but the index is
+not independent. Once each schema owns a commit, concurrent extraction would either have
+to buffer every schema's files until a serialized Git phase at the end (which is the
+previous design, and forfeits the durable partial progress that motivated the change), or
+interleave `git add`/`commit` across threads, which corrupts the index and produces
+commits containing another schema's files.
+
+Concurrency could be recovered by extracting concurrently into per-schema buffers and
+committing sequentially afterwards. That is a genuine option if extraction time ever
+becomes the constraint; it is not implemented, because a full export of ~9,800 objects
+currently takes minutes, not hours, and sequential execution is far easier to reason
+about when a failure must stop everything after it.
 
 ---
 
@@ -225,7 +248,8 @@ configuration values into SQL.
 
 ### 4.2 Watermark
 
-The watermark is `last_successful_run` for that database from `execution_state.json`.
+The watermark is `last_successful_run` for that **schema** from `execution_state.json`
+(§4.4). It was per-database until decision D-15.
 
 - **Clock source:** the *database* clock, not the runner clock. At run-unit start the
   agent reads the database time (`SYSTIMESTAMP`) and records it as the *candidate* new
@@ -244,6 +268,55 @@ The watermark is `last_successful_run` for that database from `execution_state.j
 An ordered list of `OracleObject` value objects carrying owner, type, name, status,
 `created`, `last_ddl_time`, and the database name. This list is the work queue for
 extraction and also the basis for the "objects discovered" log counter.
+
+### 4.4 Per-schema state (`execution_state.json` v2)
+
+State is keyed by database **and schema**. A schema's watermark advances only when that
+schema's own extract → commit → push cycle has completed (decision D-15).
+
+```json
+{
+  "schema_version": 2,
+  "databases": {
+    "CLIENT_DEV": {
+      "database_name": "CLIENT_DEV",
+      "schemas": {
+        "APP_SCHEMA_1": {
+          "schema_name": "APP_SCHEMA_1",
+          "last_successful_run": "2026-08-31T07:54:38.286542+00:00",
+          "commit_sha": "296cace…",
+          "execution_status": "SUCCESS",
+          "processed_objects": 3407,
+          "execution_duration_seconds": 153.12
+        }
+      }
+    }
+  }
+}
+```
+
+Three properties follow from this shape, and each solves a defect in the v1 model:
+
+1. **Adding a schema is self-correcting.** A schema with no entry has no watermark, so it
+   receives a full export automatically. Under v1, adding a schema to the include filter
+   inherited the database's watermark and silently skipped everything that had changed in
+   that schema beforehand, while reconciliation — which is never incremental — applied to
+   it in full. Deletions took effect; content updates did not.
+2. **A failure cannot poison an unrelated schema.** Under v1 one watermark covered every
+   schema, so advancing it after a partial run claimed currency the repository did not
+   have.
+3. **Reconciliation is scoped to the schema being processed** (§9.3), which also makes the
+   mass-deletion threshold a percentage of that schema's files rather than the whole
+   database's (decision D-6, amended).
+
+**Migration from v1.** A v1 file records one watermark per database and *does not record
+which schemas were in scope when it was written*. Nothing in the file can prove the
+watermark applies to any particular schema, so the migration **discards v1 watermarks**
+and every schema takes one full export (decision D-18). The alternative — attributing the
+watermark to whichever schemas happen to be configured now — would silently skip changes
+for any schema added since, which is precisely the undetectable data loss this design
+exists to prevent. Identical content still produces no Git diff, so the cost is extraction
+time, not commit churn.
 
 ---
 
@@ -483,10 +556,12 @@ Deletion is destructive, so it is deliberately conservative:
   implausibly empty result for a schema that previously had objects — a transient
   permissions or connectivity problem must never be interpreted as "everything was
   dropped".
-- A configurable safety threshold: if reconciliation would delete more than N% of a
-  database's files (default 10%), the run unit logs an `ERROR`, deletes nothing, and
+- A configurable safety threshold: if reconciliation would delete more than N% of the
+  **schema's** files (default 10%), the run unit logs an `ERROR`, deletes nothing, and
   reports `FAILED_COMPARISON`. A genuine mass drop is then a deliberate human action with
-  `--allow-mass-delete`.
+  `--allow-mass-delete`. The scope is per schema rather than per database (decision D-6,
+  amended by D-15): a database-wide denominator lets a small schema be wiped entirely
+  while staying under the threshold.
 - Deletions are never performed in dry-run mode.
 - Reconciliation only ever considers paths under the databases and schemas currently in
   scope. Removing a schema from the include filter must not delete its history.
@@ -582,11 +657,16 @@ exits successfully. This is the mechanism that makes recompilation-only runs sil
 
 ### 11.5 Commit message
 
-Subject, as specified:
+Subject:
 
 ```
-<database>||<sysdate>: Updated Oracle objects
+<database>.<schema>||<sysdate>: Updated Oracle objects
 ```
+
+The schema component is an amendment to the format `docs/requirements.md` §9 specifies
+(`<database>||<sysdate>`), and follows from one commit per schema (decision D-17). Without
+it, a run touching four schemas produces four commits whose subjects differ only by
+timestamp, and `git log --oneline` stops telling you which schema changed.
 
 Body:
 
@@ -602,8 +682,8 @@ Objects:
 ```
 
 The object list is ordered by `OWNER, OBJECT_TYPE, OBJECT_NAME`, so two runs producing the
-same change set produce identical message bodies. When multiple databases changed in one
-execution, the subject carries the database list and the body is grouped per database.
+same change set produce identical message bodies. Every object in one commit belongs to
+the one schema that commit is for, so no grouping is needed.
 
 ### 11.6 Push
 
@@ -633,15 +713,23 @@ scheduled runs cannot race on the same branch.
 ### 11.9 State commit ordering
 
 State must not be persisted before the push succeeds, yet it must be committed *with* the
-source changes. The sequence:
+source changes. The sequence runs **once per schema** (decision D-3, amended by D-17):
 
-1. Stage DDL changes → commit → push. If this fails, nothing has been persisted.
-2. On success, write `execution_state.json`, `git commit --amend`, and force-push with
-   lease (`--force-with-lease`) to the same branch.
+1. Stage that schema's DDL changes → commit → push. If this fails, nothing has been
+   persisted for this schema and the execution stops (§14.3).
+2. On success, write that schema's entry into `execution_state.json`, `git commit --amend`,
+   and force-push with lease (`--force-with-lease`) to the same branch.
 
 `--force-with-lease` (never a bare `--force`) refuses to overwrite anything that arrived
-after our fetch. This ordering is discussed as decision D-3 in §23 — the alternative is a
-second, separate state commit, which is simpler but produces two commits per run.
+after our fetch, and is given an explicit expected SHA — the commit we ourselves just
+pushed — rather than relying on a remote-tracking ref that pushing by URL never updates.
+
+An execution therefore produces **one commit per changed schema**, not one per run. Only
+schemas that actually changed produce a commit; a schema whose re-extracted content is
+byte-identical stages nothing, commits nothing, and leaves its watermark untouched
+(§11.4). Because each schema's state is written between its own push and the next
+schema's work, an execution that fails partway leaves every completed schema correctly
+recorded.
 
 ---
 
@@ -761,14 +849,22 @@ aggregates run units.
 |---|---|---|
 | Invalid configuration | Execution | Abort before connecting. Exit 2. |
 | Unparseable state file | Execution | Abort. Never silently recreate — that would look like "no history" and trigger a full export that masks data loss. Exit 2. |
-| Oracle connection fails | Run unit | Retry per §15, then `FAILED_DATABASE`. Other databases continue. |
-| Discovery query fails | Run unit | `FAILED_DATABASE`. No files written for that database. |
-| Extraction fails for one object | Object | `FAILED_EXTRACTION`. Existing file untouched. Run unit continues. |
-| Normalization fails for one object | Object | `FAILED_NORMALIZATION`. Existing file untouched. Run unit continues. |
-| File write fails | Object | `FAILED_COMPARISON`. Logged. Run unit continues. |
-| Reconciliation threshold exceeded | Run unit | No deletions staged. `ERROR` logged. Extraction results still commit. |
-| Commit fails | Execution | `FAILED_GIT`. No state update. Non-zero exit. |
-| Push fails | Execution | Retry per §15, then `FAILED_PUSH`. **No state update.** Non-zero exit. |
+| Oracle connection fails | Execution | Retry per §15, then `FAILED_DATABASE`. **Stops the execution** (D-17); no later schema or database is attempted. |
+| Discovery query fails | Execution | `FAILED_DATABASE`. **Stops the execution.** No files written for that schema. |
+| Schema list cannot be resolved | Execution | `FAILED_DATABASE`. **Stops the execution.** Guessing the schema list would silently narrow scope. |
+| Extraction fails for one object | Object | `FAILED_EXTRACTION`. Existing file untouched. The schema continues. |
+| Normalization fails for one object | Object | `FAILED_NORMALIZATION`. Existing file untouched. The schema continues. |
+| File write fails | Object | `FAILED_COMPARISON`. Logged. The schema continues. |
+| Reconciliation threshold exceeded | Schema | No deletions staged. `ERROR` logged. That schema's extraction results still commit. |
+| Commit fails | Execution | `FAILED_GIT`. This schema's watermark is not advanced. **Stops the execution.** Non-zero exit. |
+| Push fails | Execution | Retry per §15, then `FAILED_PUSH`. **This schema's watermark is not advanced. Stops the execution.** Non-zero exit. |
+
+**Object-level failures remain contained; everything above them now stops the execution**
+(decision D-17). This is a deliberate reversal of the previous "a failure in one database
+must not stop the others" behaviour, and it is safe only because state is committed per
+schema: work completed before the failure is already pushed and recorded, so stopping
+loses nothing and the next run resumes at the schema that failed. Under the previous
+per-run state model the same rule would have discarded the entire run's progress.
 
 ### 14.4 Fail-safe guarantees
 
@@ -786,13 +882,16 @@ aggregates run units.
 | Code | Meaning |
 |---|---|
 | `0` | Success, including "nothing changed" |
-| `1` | One or more databases failed, or commit/push failed |
+| `1` | A schema failed, or commit/push failed — the execution stopped there |
 | `2` | Configuration invalid or state file unparseable |
 
-Any database-level failure produces a non-zero exit so the pipeline is visibly red, while
-the healthy databases have still been synchronized and pushed. This reconciles the two
-requirements "the pipeline must fail if an Oracle connection cannot be established" and
-"a failure in one database must not stop the others".
+The codes are unchanged; what `1` means has narrowed. It previously meant "some database
+failed, the rest were still synchronized". It now means "the execution stopped at the
+first failure", and the summary names the schema it stopped on together with the schemas
+that completed before it. The requirement "the pipeline must fail if an Oracle connection
+cannot be established" is still met. The requirement "a failure in one database must not
+stop the others" (`docs/requirements.md` §23) is **deliberately not met** — see D-17;
+per-schema state makes stopping safe, because completed work is already durable.
 
 ---
 
@@ -1157,17 +1256,30 @@ duplicate history.
 
 ## 23. Approved decisions
 
-All six decisions are approved as recommended. They are binding and may not be changed
-without owner approval (`CLAUDE.md` §8).
+All decisions below are approved. They are binding and may not be changed without owner
+approval (`CLAUDE.md` §8). D-1…D-6 date from the original design; D-15…D-18 were approved
+on 2026-08-31 and amend D-3 and D-6 where noted.
 
 | ID | Decision | Approved position |
 |---|---|---|
 | D-1 | Deleted-object reconciliation frequency | **Every execution.** Costs one metadata query and one directory walk; keeps the repository faithful. |
 | D-2 | `ALTER SESSION` for NLS and `DBMS_METADATA` transform parameters | **Permitted.** Session-scoped, changes nothing in the database, and buys determinism that client-side normalization cannot match. |
-| D-3 | State commit strategy | **Amend + `--force-with-lease`** — one commit per run. Safe because `resource_group` serializes executions. Never a bare `--force`. |
+| D-3 | State commit strategy | **Amend + `--force-with-lease`** — one commit per **schema** (amended by D-17; originally one per run). Safe because `resource_group` serializes executions. Never a bare `--force`. |
 | D-4 | Git access mechanism | **`git` CLI via `subprocess`.** No Git library dependency. |
 | D-5 | Illegal/unsafe object names | **Fail the object loudly** (`FAILED_COMPARISON` + `ERROR`). Never silently encode — encoding would break the path↔object invertibility that deletion detection depends on. |
-| D-6 | Mass-deletion safety threshold | **10%** of a database's files. Exceeding it blocks all deletions for that run and logs `ERROR`; an intentional mass drop requires `--allow-mass-delete`. |
+| D-6 | Mass-deletion safety threshold | **10%** of a **schema's** files (amended by D-15; originally a database's). Exceeding it blocks all deletions for that schema and logs `ERROR`; an intentional mass drop requires `--allow-mass-delete`. |
+
+### Approved 2026-08-31 — per-schema processing
+
+| ID | Decision | Approved position |
+|---|---|---|
+| D-15 | Unit of work and state granularity | **The schema, not the database.** `execution_state.json` moves to v2, keyed by database and schema, and each schema carries its own watermark advanced only by its own successful push (§4.4). Reconciliation and the D-6 threshold are scoped to the schema being processed. |
+| D-16 | Concurrency | **Sequential throughout** — the cross-database thread pool is removed (§1.3). Per-schema commits and a shared Git index cannot coexist with concurrent extraction without either buffering everything until the end (forfeiting durable partial progress) or corrupting the index. Recoverable later by extracting into per-schema buffers and committing sequentially, if extraction time ever becomes the constraint. |
+| D-17 | Failure semantics | **Stop the execution at the first schema-level failure.** No later schema or database is attempted; the failing schema's watermark is not advanced. Object-level failures stay contained as before. This knowingly departs from `docs/requirements.md` §23 ("a failure in one database must not stop the others") and is safe only because D-15 makes completed work durable before the failure. |
+| D-18 | v1 → v2 state migration | **Discard v1 watermarks.** A v1 file does not record which schemas were in scope when its watermark was written, so no attribution can be proven. Every schema takes one full export. Attributing it to the currently-configured schemas would silently skip changes for any schema added since — the same class of undetectable data loss the timezone defect produced. |
+
+Commit subjects gain a schema component as a consequence of D-17 — see §11.5. That
+amends the format `docs/requirements.md` §9 specifies.
 
 ---
 

@@ -16,7 +16,7 @@ from datetime import datetime
 from src.config.models import DatabaseConfig, Settings
 from src.exceptions import DiscoveryError
 from src.logging.logger import get_logger
-from src.models.database import DatabaseRuntime
+from src.models.database import SchemaRuntime
 from src.models.oracle_object import ObjectType, OracleObject, OracleStatus
 from src.oracle import sql
 from src.oracle.connection import Session, is_transient
@@ -34,26 +34,78 @@ _ORACLE_MAINTAINED_MIN_VERSION = 12
 class ObjectDiscovery:
     """Builds and runs the ``DBA_OBJECTS`` queries for one database."""
 
-    def __init__(self, session: Session, database: DatabaseConfig, settings: Settings) -> None:
+    def __init__(
+        self,
+        session: Session,
+        database: DatabaseConfig,
+        settings: Settings,
+        schema: str | None = None,
+    ) -> None:
         """Create a discovery service.
 
         Args:
             session: An initialized read-only session.
             database: The database being processed, supplying the filters.
             settings: Global settings, supplying the retry budget.
+            schema: Restrict discovery and inventory to this one schema — the
+                unit of work under decision D-15. ``None`` keeps the
+                configured include filter, which is what
+                :meth:`list_schemas` needs.
         """
         self.session = session
         self.database = database
         self.settings = settings
+        self.schema = schema
 
-    def discover_changed(self, runtime: DatabaseRuntime) -> list[OracleObject]:
+    @property
+    def _include(self) -> tuple[str, ...]:
+        """The include filter for this service: one schema, or the configured set."""
+        return (self.schema,) if self.schema else self.database.schemas.include
+
+    def list_schemas(self) -> list[str]:
+        """Return the in-scope schemas, as the database actually reports them.
+
+        Resolved from ``DBA_OBJECTS`` rather than taken from the configuration
+        even when ``include`` is populated, and that is deliberate. A schema
+        named in ``include`` that holds no in-scope objects — a typo, a dropped
+        schema, a missing grant — would otherwise be processed with an empty
+        inventory, and reconciliation would read that as "every object was
+        dropped" and stage the deletion of every file under it. Resolving the
+        list from the database means such a schema is simply absent from it,
+        never processed, and its files are left untouched (§9.3).
+
+        Returns:
+            Schema names ordered by ``OWNER``.
+
+        Raises:
+            DiscoveryError: If the query fails after its retry budget.
+        """
+        statement, binds = sql.build_schema_list_query(
+            object_types=tuple(str(t) for t in self.database.object_types.types),
+            include_schemas=self.database.schemas.include,
+            exclude_schemas=self.database.schemas.exclude,
+            oracle_maintained_column=(
+                self.session.server_major_version >= _ORACLE_MAINTAINED_MIN_VERSION
+            ),
+        )
+        rows = self._fetch(statement, binds, "schema list")
+        schemas = [row[0] for row in rows if row and row[0]]
+        _log.info(
+            "%d schema(s) in scope: %s",
+            len(schemas),
+            ", ".join(schemas) or "-",
+            extra={"database": self.database.name},
+        )
+        return schemas
+
+    def discover_changed(self, runtime: SchemaRuntime) -> list[OracleObject]:
         """Return objects whose ``LAST_DDL_TIME`` is past the watermark.
 
         On a full export (no watermark) the predicate is omitted entirely and
         every in-scope object is returned.
 
         Args:
-            runtime: The database being processed, carrying its watermark.
+            runtime: The schema being processed, carrying its watermark.
 
         Returns:
             Objects ordered by ``OWNER, OBJECT_TYPE, OBJECT_NAME``, deduplicated
@@ -120,7 +172,7 @@ class ObjectDiscovery:
         """
         statement, binds = sql.build_discovery_query(
             object_types=tuple(str(t) for t in self.database.object_types.types),
-            include_schemas=self.database.schemas.include,
+            include_schemas=self._include,
             exclude_schemas=self.database.schemas.exclude,
             incremental=incremental,
             oracle_maintained_column=(
@@ -129,6 +181,30 @@ class ObjectDiscovery:
         )
         binds.update(extra_binds)
 
+        rows = self._fetch(statement, binds, what)
+        objects = self._map(rows)
+        _log.info(
+            "%s returned %d object(s)",
+            what,
+            len(objects),
+            extra={"database": self.database.name},
+        )
+        return objects
+
+    def _fetch(self, statement: str, binds: dict, what: str) -> list[tuple]:
+        """Execute one query under the configured retry budget.
+
+        Args:
+            statement: The assembled statement.
+            binds: Its bind values.
+            what: What is being queried, for log and error messages.
+
+        Returns:
+            The raw result rows.
+
+        Raises:
+            DiscoveryError: If the query fails after its retry budget.
+        """
         retry = self.settings.retry
         policy = RetryPolicy(
             attempts=retry.query_attempts,
@@ -138,7 +214,7 @@ class ObjectDiscovery:
         extra = {"database": self.database.name}
 
         try:
-            rows = retry_call(
+            return retry_call(
                 lambda: self.session.fetch_all(statement, binds),
                 policy=policy,
                 is_retryable=is_transient,
@@ -150,10 +226,6 @@ class ObjectDiscovery:
             )
         except Exception as exc:
             raise DiscoveryError(f"{self.database.name}: {what} query failed: {exc}") from exc
-
-        objects = self._map(rows)
-        _log.info("%s returned %d object(s)", what, len(objects), extra=extra)
-        return objects
 
     def _map(self, rows: list[tuple]) -> list[OracleObject]:
         """Map result rows to objects, dropping duplicates and unknown types.

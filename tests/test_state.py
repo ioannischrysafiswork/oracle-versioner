@@ -18,7 +18,13 @@ import pytest
 from src.exceptions import StateError
 from src.models.execution import ExecutionStatus
 from src.state.execution_state import ExecutionStateStore
-from src.state.models import STATE_SCHEMA_VERSION, DatabaseState, ExecutionState
+from src.state.models import (
+    LEGACY_STATE_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION,
+    DatabaseState,
+    ExecutionState,
+    SchemaState,
+)
 
 MOMENT = datetime(2026, 1, 1, 12, 30, 45, tzinfo=UTC)
 
@@ -28,11 +34,16 @@ def _populated() -> ExecutionState:
         databases={
             "HRDB": DatabaseState(
                 database_name="HRDB",
-                last_successful_run=MOMENT,
-                commit_sha="abc123",
-                execution_status=ExecutionStatus.SUCCESS,
-                processed_objects=7,
-                execution_duration_seconds=12.5,
+                schemas={
+                    "HR": SchemaState(
+                        schema_name="HR",
+                        last_successful_run=MOMENT,
+                        commit_sha="abc123",
+                        execution_status=ExecutionStatus.SUCCESS,
+                        processed_objects=7,
+                        execution_duration_seconds=12.5,
+                    )
+                },
             )
         }
     )
@@ -41,37 +52,56 @@ def _populated() -> ExecutionState:
 # --------------------------------------------------------------------------- model
 
 
-def test_missing_database_entry_means_full_export() -> None:
-    """No watermark for a database implies a full export."""
-    assert ExecutionState().watermark_for("TESTDB") is None
-    assert _populated().watermark_for("OTHERDB") is None
+def test_missing_entry_means_full_export() -> None:
+    """No watermark for a schema implies a full export of it."""
+    assert ExecutionState().watermark_for("TESTDB", "HR") is None
+    assert _populated().watermark_for("OTHERDB", "HR") is None
 
 
 def test_watermark_is_returned_when_present() -> None:
-    """A recorded last successful run becomes the watermark."""
-    assert _populated().watermark_for("HRDB") == MOMENT
+    """A recorded last successful run becomes that schema's watermark."""
+    assert _populated().watermark_for("HRDB", "HR") == MOMENT
+
+
+def test_a_new_schema_of_a_known_database_has_no_watermark() -> None:
+    """Adding a schema is self-correcting: it gets a full export, not a stale one.
+
+    The defect this prevents: under the per-database model, a schema added to
+    the include filter inherited the database's watermark and silently skipped
+    everything that had changed in it beforehand — while reconciliation, which
+    is never incremental, applied to it in full.
+    """
+    assert _populated().watermark_for("HRDB", "PAYROLL") is None
 
 
 def test_default_schema_version() -> None:
     """The schema version is frozen; bumping it needs owner approval."""
-    assert ExecutionState().schema_version == STATE_SCHEMA_VERSION == 1
+    assert ExecutionState().schema_version == STATE_SCHEMA_VERSION == 2
 
 
-def test_database_state_defaults() -> None:
-    """A fresh database state carries no watermark and no commit."""
-    state = DatabaseState(database_name="TESTDB")
+def test_schema_state_defaults() -> None:
+    """A fresh schema state carries no watermark and no commit."""
+    state = SchemaState(schema_name="HR")
     assert state.last_successful_run is None
     assert state.commit_sha is None
     assert state.execution_status is ExecutionStatus.SUCCESS
     assert state.processed_objects == 0
 
 
-def test_with_database_does_not_mutate_the_original() -> None:
+def test_with_schema_does_not_mutate_the_original() -> None:
     """Advancing a watermark produces a new value, never an in-place edit."""
     original = ExecutionState()
-    updated = original.with_database(DatabaseState("HRDB", last_successful_run=MOMENT))
+    updated = original.with_schema("HRDB", SchemaState("HR", last_successful_run=MOMENT))
     assert original.databases == {}
-    assert updated.watermark_for("HRDB") == MOMENT
+    assert updated.watermark_for("HRDB", "HR") == MOMENT
+
+
+def test_advancing_one_schema_leaves_its_siblings_alone() -> None:
+    """A schema's watermark is its own; nothing else in the run may move it."""
+    later = MOMENT + timedelta(hours=1)
+    state = _populated().with_schema("HRDB", SchemaState("PAYROLL", last_successful_run=later))
+    assert state.watermark_for("HRDB", "HR") == MOMENT
+    assert state.watermark_for("HRDB", "PAYROLL") == later
 
 
 # --------------------------------------------------------------------------- serialization
@@ -86,14 +116,14 @@ def test_round_trip_preserves_every_field() -> None:
 def test_timestamps_serialize_as_utc_iso8601() -> None:
     """Serialized timestamps never depend on the runner's timezone."""
     offset = datetime(2026, 1, 1, 14, 30, 45, tzinfo=timezone(timedelta(hours=2)))
-    payload = DatabaseState("HRDB", last_successful_run=offset).to_dict()
+    payload = SchemaState("HR", last_successful_run=offset).to_dict()
     assert payload["last_successful_run"] == "2026-01-01T12:30:45+00:00"
 
 
 def test_naive_timestamps_are_read_as_utc() -> None:
     """A naive timestamp is UTC, never local time."""
-    state = DatabaseState.from_dict(
-        {"database_name": "HRDB", "last_successful_run": "2026-01-01T12:30:45"}, "ctx"
+    state = SchemaState.from_dict(
+        {"schema_name": "HR", "last_successful_run": "2026-01-01T12:30:45"}, "ctx"
     )
     assert state.last_successful_run == MOMENT
 
@@ -106,6 +136,15 @@ def test_databases_serialize_in_sorted_order() -> None:
     assert list(state.to_dict()["databases"]) == ["ADB", "MDB", "ZDB"]
 
 
+def test_schemas_serialize_in_sorted_order() -> None:
+    """Same reason, one level down."""
+    state = ExecutionState()
+    for name in ("ZS", "AS_", "MS"):
+        state = state.with_schema("HRDB", SchemaState(name))
+    serialized = state.to_dict()["databases"]["HRDB"]["schemas"]
+    assert list(serialized) == ["AS_", "MS", "ZS"]
+
+
 @pytest.mark.parametrize(
     ("payload", "match"),
     [
@@ -116,16 +155,53 @@ def test_databases_serialize_in_sorted_order() -> None:
         ({"databases": {"HRDB": {"database_name": "OTHER"}}}, "contradicts its key"),
         ({"databases": {"HRDB": {"database_name": "HRDB", "nope": 1}}}, "unknown key"),
         ({"databases": {"HRDB": {"database_name": ""}}}, "non-empty string"),
+        ({"databases": {"HRDB": {"database_name": "HRDB", "schemas": []}}}, "expected an object"),
         (
-            {"databases": {"HRDB": {"database_name": "HRDB", "last_successful_run": "junk"}}},
+            {"databases": {"HRDB": {"database_name": "HRDB", "schemas": {"HR": {}}}}},
+            "non-empty string",
+        ),
+        (
+            {
+                "databases": {
+                    "HRDB": {
+                        "database_name": "HRDB",
+                        "schemas": {"HR": {"schema_name": "OTHER"}},
+                    }
+                }
+            },
+            "contradicts its key",
+        ),
+        (
+            {
+                "databases": {
+                    "HRDB": {
+                        "database_name": "HRDB",
+                        "schemas": {"HR": {"schema_name": "HR", "last_successful_run": "junk"}},
+                    }
+                }
+            },
             "not a valid ISO-8601",
         ),
         (
-            {"databases": {"HRDB": {"database_name": "HRDB", "processed_objects": -1}}},
+            {
+                "databases": {
+                    "HRDB": {
+                        "database_name": "HRDB",
+                        "schemas": {"HR": {"schema_name": "HR", "processed_objects": -1}},
+                    }
+                }
+            },
             "non-negative integer",
         ),
         (
-            {"databases": {"HRDB": {"database_name": "HRDB", "execution_status": "WAT"}}},
+            {
+                "databases": {
+                    "HRDB": {
+                        "database_name": "HRDB",
+                        "schemas": {"HR": {"schema_name": "HR", "execution_status": "WAT"}},
+                    }
+                }
+            },
             "unknown status",
         ),
     ],
@@ -136,6 +212,59 @@ def test_malformed_state_is_rejected(payload: object, match: str) -> None:
         ExecutionState.from_dict(payload)
 
 
+# --------------------------------------------------------------------------- migration
+
+
+def _v1_payload() -> dict:
+    """A state file as the per-database build wrote it."""
+    return {
+        "schema_version": LEGACY_STATE_SCHEMA_VERSION,
+        "databases": {
+            "HRDB": {
+                "database_name": "HRDB",
+                "last_successful_run": MOMENT.isoformat(),
+                "commit_sha": "abc123",
+                "execution_status": "SUCCESS",
+                "processed_objects": 3407,
+                "execution_duration_seconds": 153.0,
+            }
+        },
+    }
+
+
+def test_v1_state_is_migrated_not_rejected() -> None:
+    """An existing deployment's state file still loads."""
+    state = ExecutionState.from_dict(_v1_payload())
+    assert state.schema_version == STATE_SCHEMA_VERSION
+
+
+def test_v1_watermarks_are_discarded() -> None:
+    """Decision D-18: no schema inherits a watermark it cannot be proven to own.
+
+    A v1 file records one watermark per database and does not record which
+    schemas were in scope when it was written. Attributing it to whichever
+    schemas happen to be configured now would silently skip every change made
+    to a schema added since — the same class of undetectable data loss the
+    timezone defect produced.
+    """
+    state = ExecutionState.from_dict(_v1_payload())
+    assert state.watermark_for("HRDB", "HR") is None
+    assert state.databases == {}
+
+
+def test_migrated_state_is_written_back_at_the_new_version(tmp_path: Path) -> None:
+    """The upgrade is durable: the next run reads v2, not v1 again."""
+    path = tmp_path / "execution_state.json"
+    path.write_text(json.dumps(_v1_payload()), encoding="utf-8")
+    store = ExecutionStateStore(path)
+    migrated = store.load()
+    store.save(migrated.with_schema("HRDB", SchemaState("HR", last_successful_run=MOMENT)))
+
+    reloaded = json.loads(path.read_text(encoding="utf-8"))
+    assert reloaded["schema_version"] == STATE_SCHEMA_VERSION
+    assert reloaded["databases"]["HRDB"]["schemas"]["HR"]["last_successful_run"]
+
+
 # --------------------------------------------------------------------------- store
 
 
@@ -143,7 +272,7 @@ def test_missing_file_means_full_export(tmp_path: Path) -> None:
     """No state file is a normal first run, not an error."""
     state = ExecutionStateStore(tmp_path / "execution_state.json").load()
     assert state.databases == {}
-    assert state.watermark_for("HRDB") is None
+    assert state.watermark_for("HRDB", "HR") is None
 
 
 def test_corrupt_file_is_fatal_and_left_untouched(tmp_path: Path) -> None:

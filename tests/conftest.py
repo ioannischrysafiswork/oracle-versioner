@@ -125,9 +125,12 @@ class FakeSession:
         for fragment, exc in self.failures.items():
             if fragment in statement:
                 raise exc
-        for fragment, rows in self._rows.items():
+        # Longest fragment first, so a specific key ("DISTINCT owner") wins
+        # over a general one ("dba_objects") that also appears in the same
+        # statement. Insertion order would make scripting order-sensitive.
+        for fragment in sorted(self._rows, key=len, reverse=True):
             if fragment in statement:
-                return list(rows)
+                return list(self._rows[fragment])
         return []
 
     def fetch_value(self, statement: str, binds: dict | None = None):
