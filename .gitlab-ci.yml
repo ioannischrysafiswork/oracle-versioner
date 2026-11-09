@@ -48,7 +48,7 @@ unit-tests:
   stage: validate
   before_script:
     - apt-get update && apt-get install --no-install-recommends -y git
-    - git config --global user.email "developer@example.com"
+    - git config --global user.email "ioannischrysafis93@gmail.com"
     - git config --global user.name "CHRYSAFIS Ioannis"
     - pip install -r requirements-dev.txt
   script:

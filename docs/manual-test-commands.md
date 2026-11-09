@@ -23,7 +23,7 @@ No Oracle, no network. Confirms the read-only SQL guard and the log
 redaction filter both still work.
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 .\.venv\Scripts\python.exe -m pytest tests/test_connection.py tests/test_logging.py -v
 ```
 
@@ -32,7 +32,7 @@ cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
 
 For the full offline suite instead of just these two files:
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
@@ -44,7 +44,7 @@ Proves the DB connection, discovery, and extraction work, without touching
 disk or git at all.
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 $env:CLIENTDB_DSN = "db-host.example.com:1521/DEVDB"
 $env:CLIENTDB_USER = "APP_SCHEMA_1"
 $env:CLIENTDB_PASSWORD = "..."
@@ -64,7 +64,7 @@ Same as #2, but actually writes `.sql` files to `repository/`. Still touches
 no git command at all.
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 $env:CLIENTDB_DSN = "db-host.example.com:1521/DEVDB"
 $env:CLIENTDB_USER = "APP_SCHEMA_1"
 $env:CLIENTDB_PASSWORD = "..."
@@ -84,7 +84,7 @@ Standalone, no Oracle involved. Proves git identity, staging, commit, and
 push all work, using this repo's real `origin` remote.
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 .\.venv\Scripts\python.exe scratch_test_git_push.py
 ```
 
@@ -108,7 +108,7 @@ matters locally; a GitLab Runner won't have SSH available and must use this
 path, so it needs to work *there* even though it doesn't here.
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 $env:GIT_PUSH_TOKEN = "glpat-..."
 $env:GIT_TEST_REMOTE = "gitlab-token"
 git remote add gitlab-token https://gitlab.example.com/developer/oracle_versioning.git
@@ -128,7 +128,7 @@ The real thing, no flags. Only run this when you're ready for it to actually
 commit and push.
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 $env:CLIENTDB_DSN = "db-host.example.com:1521/DEVDB"
 $env:CLIENTDB_USER = "APP_SCHEMA_1"
 $env:CLIENTDB_PASSWORD = "..."
@@ -149,7 +149,7 @@ if a push actually succeeded.
 ## 7. Docker image build
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 docker build -t oracle-versioner:test .
 ```
 
@@ -170,7 +170,7 @@ like the app found nothing to do (`0 database(s)`), not like an error.
 ## 8. Docker image run
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 docker run --rm oracle-versioner:test --version
 docker run --rm oracle-versioner:test --dry-run
 ```
@@ -186,7 +186,7 @@ image to have been rebuilt (#7) after `config/databases.yml` last changed —
 see the note above.
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 docker run --rm `
   -e CLIENTDB_DSN="db-host.example.com:1521/DEVDB" `
   -e CLIENTDB_USER="APP_SCHEMA_1" `
@@ -215,7 +215,7 @@ Setup used for both attempts — a temporary `gitlab` remote alias, since
 is named `origin` (see #11 below — left unfixed on purpose):
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 git remote add gitlab <same URL as origin, ssh:// or https://>
 # ...and later, to clean up:
 git remote remove gitlab
@@ -295,7 +295,7 @@ disabled via a `git` command-line flag (not an env var, since here we're
 calling `git` ourselves, not through the app):
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 docker run --rm `
   --entrypoint sh `
   -v "${PWD}:/app" `
@@ -324,7 +324,7 @@ own — no other layered problem to find once that's done.
 Confirms a Runner exists and is online, without triggering any pipeline.
 
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 git ls-remote origin
 ```
 
@@ -344,7 +344,7 @@ git:
 
 But no checkout's git remote is named `gitlab` — this clone's is `origin`:
 ```powershell
-cd "C:\Users\developer\OneDrive\Desktop\GIT\oracle_versioning"
+cd "C:\Users\developer\Desktop\GIT\oracle_versioning"
 git remote -v
 # origin  git@gitlab.example.com:developer/oracle_versioning.git
 ```
